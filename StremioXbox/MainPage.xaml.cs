@@ -120,6 +120,8 @@ namespace StremioXbox
         private bool _upNextDismissed;
         private bool _subtitleUserChoice;
         private bool _subtitleAutoDone;
+        private volatile bool _audioDecided;  // The first audio choice is made (subtitles wait for it).
+        private volatile bool _originalAudio; // A foreign title plays in its own language: English subtitles on.
 
         // D-pad / shoulder seeking: presses add up to a target that is applied once they stop.
         private TimeSpan? _scrubTarget;
@@ -906,7 +908,9 @@ namespace StremioXbox
             _skipIntroDismissed = false;
             ApplyIntro(request.IntroFromMs, request.IntroToMs);
             _subtitleUserChoice = false;
-            _subtitleAutoDone = string.IsNullOrEmpty(request.SubtitlesLanguage);
+            _subtitleAutoDone = false;
+            _audioDecided = false;
+            _originalAudio = false;
             _reopening = false;
             _reopenFallback = -1;
             _restoreSubtitle = null;
@@ -1443,7 +1447,8 @@ namespace StremioXbox
                     return;
                 }
 
-                var pick = audioIndex >= 0 ? audioIndex : PickAudioTrack(tracks, request.AudioLanguage);
+                var decision = audioIndex >= 0 ? null : PickAudioTrack(tracks, request);
+                var pick = audioIndex >= 0 ? audioIndex : decision.Index;
                 if (pick < 0 || pick >= tracks.Count)
                 {
                     return;
@@ -1456,21 +1461,38 @@ namespace StremioXbox
                 }
 
                 var chosen = tracks[pick];
-                if (audioIndex < 0)
+                if (decision != null)
                 {
                     var before = current >= 0 && current < tracks.Count ? tracks[current] : null;
+                    var notes = new List<string>();
+                    if (decision.OriginalLanguage)
+                    {
+                        notes.Add("Original " + LanguageName(decision.Language) + " audio");
+                    }
+
                     if (before != null && pick != current && IsTrueHd(before) && !IsTrueHd(chosen))
                     {
-                        _audioNote = "Audio: " + AudioFormatName(chosen) + " instead of Dolby TrueHD (often silent on Xbox) · Y to change";
+                        notes.Add(AudioFormatName(chosen) + " instead of Dolby TrueHD (often silent on Xbox)");
                     }
                     else if (IsTrueHd(chosen))
                     {
-                        _audioNote = "Dolby TrueHD can be silent on Xbox. No sound? Press Y for another track, or pick another stream";
+                        notes.Add("Dolby TrueHD can be silent on Xbox. No sound? Press Y for another track, or pick another stream");
                     }
+
+                    _audioNote = notes.Count == 0 ? null : string.Join("   ·   ", notes) + (IsTrueHd(chosen) ? string.Empty : "   ·   Y to change");
+                    _originalAudio = decision.OriginalLanguage;
                 }
 
-                LogAsync("info", string.Format("Audio track {0}/{1}: {2}{3}", pick + 1, tracks.Count, DescribeAudio(chosen),
-                    pick != current ? " (default was " + (current + 1) + (audioIndex >= 0 ? ", audio switch)" : ")") : string.Empty));
+                var country = string.IsNullOrEmpty(request.Country) ? "unknown" : request.Country;
+                LogAsync("info", string.Format("Audio track {0}/{1}: {2}{3}{4}", pick + 1, tracks.Count, DescribeAudio(chosen),
+                    pick != current ? " (default was " + (current + 1) + (audioIndex >= 0 ? ", audio switch)" : ")") : string.Empty,
+                    decision == null ? string.Empty
+                        : decision.OriginalLanguage ? ", original language of a title from " + country + ": English subtitles on"
+                        : ", country " + country));
+
+                // Subtitles wait for this choice (English ones go on for a foreign title in its own language).
+                _audioDecided = true;
+                _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => AutoSelectSubtitles(item));
             }
             catch (Exception ex)
             {
@@ -1478,44 +1500,29 @@ namespace StremioXbox
             }
         }
 
-        // Stremio's audio language when the file has it, else the file's default language; within that
-        // language, a format the Xbox plays reliably (TrueHD is often silent), then the default track, and
-        // never a commentary over the main track.
-        private static int PickAudioTrack(IReadOnlyList<AudioTrack> tracks, string preferredLanguage)
+        // See AudioChoice: English (or a foreign title's own language), then the best track the Xbox plays reliably.
+        private static AudioDecision PickAudioTrack(IReadOnlyList<AudioTrack> tracks, PlayRequest request)
         {
-            var current = 0; // The platform starts on the container's default track, listed first.
-            string language = null;
-            if (!string.IsNullOrEmpty(preferredLanguage))
+            var options = tracks.Select(track =>
             {
-                for (var i = 0; i < tracks.Count; i++)
-                {
-                    if (LanguageMatches(tracks[i].Language, preferredLanguage))
-                    {
-                        language = NormalizeLanguage(tracks[i].Language);
-                        break;
-                    }
-                }
-            }
+                var props = track.GetEncodingProperties();
+                return new AudioOption(NormalizeLanguage(track.Language), track.Label, FormatOf(track), (int)props.ChannelCount);
+            }).ToList();
+            return AudioChoice.Choose(options, request.Country, NormalizeLanguage(request.AudioLanguage));
+        }
 
-            language = language ?? NormalizeLanguage(tracks[current].Language);
-            var best = current;
-            var bestScore = int.MinValue;
-            for (var i = 0; i < tracks.Count; i++)
+        private static AudioFormat FormatOf(AudioTrack track)
+        {
+            switch (AudioFormatName(track))
             {
-                if (NormalizeLanguage(tracks[i].Language) != language)
-                {
-                    continue;
-                }
-
-                var score = (IsTrueHd(tracks[i]) ? 0 : 4) + (i == current ? 2 : 0) - (IsCommentary(tracks[i]) ? 8 : 0);
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    best = i;
-                }
+                case "Dolby TrueHD": return AudioFormat.TrueHd;
+                case "Dolby Digital Plus": return AudioFormat.DolbyDigitalPlus;
+                case "Dolby Digital": return AudioFormat.DolbyDigital;
+                case "DTS": return AudioFormat.Dts;
+                default:
+                    var subtype = (track.GetEncodingProperties().Subtype ?? string.Empty).ToUpperInvariant();
+                    return subtype.Contains("AAC") ? AudioFormat.Aac : AudioFormat.Other;
             }
-
-            return best;
         }
 
         private static bool IsTrueHd(AudioTrack track)
@@ -1526,11 +1533,6 @@ namespace StremioXbox
             // MEDIASUBTYPE_DOLBY_TRUEHD has no WinRT name; the subtype then reads as its GUID.
             return subtype.Contains("TRUEHD") || subtype.Contains("MLP") || subtype.Contains("EB27CEC4-163E-4CA3-8B74-8E25F91B517E") ||
                 label.Contains("TRUEHD") || label.Contains("TRUE HD");
-        }
-
-        private static bool IsCommentary(AudioTrack track)
-        {
-            return (track.Label ?? string.Empty).IndexOf("comment", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         // Live when the format stays the same; otherwise reopen the file with the new track (see _reopening).
@@ -3037,7 +3039,9 @@ namespace StremioXbox
         }
 
         // Like Stremio: turn on subtitles in the language set in Stremio's settings, once, unless the viewer
-        // already chose. Embedded tracks resolve first; addon subtitles follow as their files download.
+        // already chose; for a foreign title playing in its own language, English ones. Embedded tracks
+        // resolve first; addon subtitles follow as their files download. Forced tracks (only the lines in
+        // another language) are skipped: they are not full subtitles.
         private void AutoSelectSubtitles(MediaPlaybackItem item)
         {
             if (_restoreSubtitle != null && _mediaPlayer?.Source == item)
@@ -3063,8 +3067,15 @@ namespace StremioXbox
                 return;
             }
 
-            if (_subtitleAutoDone || _subtitleUserChoice || _current == null || _mediaPlayer?.Source != item)
+            if (_subtitleAutoDone || _subtitleUserChoice || _current == null || _mediaPlayer?.Source != item || !_audioDecided)
             {
+                return;
+            }
+
+            var language = _originalAudio ? "en" : _current.SubtitlesLanguage;
+            if (string.IsNullOrEmpty(language))
+            {
+                _subtitleAutoDone = true;
                 return;
             }
 
@@ -3073,10 +3084,15 @@ namespace StremioXbox
                 var tracks = item.TimedMetadataTracks;
                 for (var i = 0; i < tracks.Count; i++)
                 {
-                    if (IsSubtitleTrack(tracks[i]) && LanguageMatches(tracks[i].Language, _current.SubtitlesLanguage))
+                    if (IsSubtitleTrack(tracks[i]) && LanguageMatches(tracks[i].Language, language) && !IsForcedSubtitle(tracks[i]))
                     {
                         _subtitleAutoDone = true;
                         SelectSubtitle(item, i, false);
+                        if (_originalAudio)
+                        {
+                            AddOsdNote("English subtitles   ·   X to change");
+                        }
+
                         return;
                     }
                 }
@@ -3085,6 +3101,11 @@ namespace StremioXbox
             {
                 Log("warn", "Subtitle auto-select failed: " + ex.Message);
             }
+        }
+
+        private static bool IsForcedSubtitle(TimedMetadataTrack track)
+        {
+            return (track.Label ?? string.Empty).IndexOf("forced", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         // Stremio uses ISO 639-2 codes ("eng", "ger"); files and addons use 639-1 or 639-2 ("en", "deu").
@@ -3098,6 +3119,7 @@ namespace StremioXbox
             ["vie"] = "vi", ["tha"] = "th", ["ind"] = "id", ["may"] = "ms", ["msa"] = "ms", ["hrv"] = "hr", ["srp"] = "sr",
             ["slv"] = "sl", ["slo"] = "sk", ["slk"] = "sk", ["per"] = "fa", ["fas"] = "fa", ["tam"] = "ta", ["tel"] = "te",
             ["ben"] = "bn", ["mal"] = "ml", ["est"] = "et", ["lav"] = "lv", ["lit"] = "lt", ["ice"] = "is", ["isl"] = "is",
+            ["kan"] = "kn", ["mar"] = "mr", ["pan"] = "pa", ["guj"] = "gu", ["tgl"] = "tl", ["fil"] = "tl", ["nno"] = "nn",
         };
 
         private static string NormalizeLanguage(string code)

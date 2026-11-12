@@ -1184,9 +1184,10 @@
         return Promise.all(requests).then(function (results) {
             results.forEach(function (result) { list = list.concat(result); });
             var preferred = profile.settings && profile.settings.subtitlesLanguage;
-            if (preferred) {
-                list.sort(function (a, b) { return (b.lang === preferred) - (a.lang === preferred); });
-            }
+            // The preferred language first, then English (a foreign title plays with English subtitles),
+            // so neither is cut by the limits below. Array.sort is stable, so addon order holds within each.
+            var rank = function (sub) { return sub.lang === preferred ? 0 : /^(eng?|english)$/i.test(sub.lang) ? 1 : 2; };
+            list.sort(function (a, b) { return rank(a) - rank(b); });
             var perLanguage = {};
             var picked = list.filter(function (sub) {
                 perLanguage[sub.lang] = (perLanguage[sub.lang] || 0) + 1;
@@ -1236,6 +1237,23 @@
 
     function playerState() {
         return coreCall(function (core) { return core.getState('player'); }, null);
+    }
+
+    // The title's main country of production (Cinemeta lists it first: "Japan, United States"). The app
+    // uses it to tell a foreign-language title, played in its original language with English subtitles.
+    var COUNTRY_TIMEOUT_MS = 3000;
+    function titleCountry(type, id) {
+        if (!/^tt\d+$/.test(id || '') || (type !== 'movie' && type !== 'series')) {
+            return Promise.resolve('');
+        }
+        var url = 'https://v3-cinemeta.strem.io/meta/' + encodeURIComponent(type) + '/' + encodeURIComponent(id) + '.json';
+        return fetchWithTimeout(url, COUNTRY_TIMEOUT_MS).then(function (result) {
+            var country = result && result.meta && result.meta.country;
+            return typeof country === 'string' ? country.split(',')[0].trim() : '';
+        }).catch(function (e) {
+            log('warn', 'Country of the title unknown: ' + format(e));
+            return '';
+        });
     }
 
     function stremioSettings() {
@@ -1562,14 +1580,16 @@
                     next: info.next || '',
                     binge: settings.bingeWatching !== false,
                     subtitlesLanguage: settings.subtitlesLanguage || '',
-                    audioLanguage: settings.audioLanguage || ''
+                    audioLanguage: settings.audioLanguage || '',
+                    country: info.country || ''
                 });
                 watchNext(s, info.next, info.intro);
             }
 
-            Promise.all([collectSubtitles(stream, type, videoId), loadSession(s), stremioSettings()]).then(function (results) {
+            Promise.all([collectSubtitles(stream, type, videoId), loadSession(s), stremioSettings(), titleCountry(type, parts[4] || '')]).then(function (results) {
                 var info = describeSession(results[1], s);
-                log('info', 'Session: "' + info.title + '" ' + info.subtitle + ', resume ' + Math.round(info.resumeMs / 1000) + ' s, next ' + (info.next || 'none'));
+                info.country = results[3] || '';
+                log('info', 'Session: "' + info.title + '" ' + info.subtitle + ', resume ' + Math.round(info.resumeMs / 1000) + ' s, next ' + (info.next || 'none') + ', country ' + (info.country || 'unknown'));
                 postPlay(results[0], info, results[2] || {});
             }).catch(function (e) {
                 log('error', 'Preparing playback failed: ' + format(e));

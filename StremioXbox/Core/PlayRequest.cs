@@ -54,6 +54,9 @@ namespace StremioXbox.Core
         /// <summary>Gets Stremio's preferred audio language (ISO 639-2, e.g. "eng"), or empty.</summary>
         public string AudioLanguage { get; private set; }
 
+        /// <summary>Gets the title's main country of production (from Cinemeta), or empty when unknown.</summary>
+        public string Country { get; private set; }
+
         /// <summary>Gets external subtitles collected from the stream and the user's subtitle addons.</summary>
         public IReadOnlyList<SubtitleSource> Subtitles { get; private set; } = new List<SubtitleSource>();
 
@@ -98,6 +101,7 @@ namespace StremioXbox.Core
                 Binge = message.GetNamedBoolean("binge", true),
                 SubtitlesLanguage = message.GetNamedString("subtitlesLanguage", string.Empty),
                 AudioLanguage = message.GetNamedString("audioLanguage", string.Empty),
+                Country = message.GetNamedString("country", string.Empty),
             };
         }
 

@@ -9,7 +9,7 @@
   <Identity
     Name="StremioXbox"
     Publisher="CN=StremioXboxDev"
-    Version="0.2.4.0" />
+    Version="0.2.5.0" />
 
   <mp:PhoneIdentity PhoneProductId="2e83f343-d138-4c8e-b0b8-35b80f886e35" PhonePublisherId="00000000-0000-0000-0000-000000000000" />
 

@@ -93,7 +93,7 @@ An Up Next card near the end of an episode. With Stremio's binge watching on, th
 <td width="50%" valign="top">
 
 **📺 Feels like an app**<br>
-Show and episode titles over the title's backdrop, a loading screen the moment you pick a stream, audio and subtitle menus, subtitles in your Stremio language, and the Xbox media remote. Browsing glides: the page eases along with the highlight and keeps the current row at the same height, and the highlighted poster grows slightly. The player fades its bar, Skip Intro / Up Next cards and Audio & Subtitles overlay in and out.
+Show and episode titles over the title's backdrop, a loading screen the moment you pick a stream, audio and subtitle menus, the best audio track in English (or the original language with English subtitles for foreign titles), subtitles in your Stremio language, and the Xbox media remote. Browsing glides: the page eases along with the highlight and keeps the current row at the same height, and the highlighted poster grows slightly. The player fades its bar, Skip Intro / Up Next cards and Audio & Subtitles overlay in and out.
 
 </td>
 <td width="50%" valign="top">
@@ -134,9 +134,15 @@ freezes the picture. Stremio-XBOX puts its own cache in between:
 - **Dolby Vision Profile 7 / 8 play as HDR10.** The Xbox's decoder only outputs DV for Profile 5, and
   turning 7/8 into 5 would mean re-encoding the video, so an app can't change this. The player says so
   on screen when a DV release plays as HDR10. Pick a Profile 5 (often WEB-DL) stream for real DV.
-- **Dolby TrueHD can be silent on Xbox.** When a file also has Dolby Digital Plus or Dolby Digital in
-  the same language, the player starts on that track instead (Y still offers TrueHD). When TrueHD is the
-  only track, it tells you, so you can pick another stream if there's no sound.
+- **Dolby TrueHD can be silent on Xbox.** When a file also has another track in the same language, the
+  player starts on that one instead (Y still offers TrueHD). When TrueHD is the only track, it tells you,
+  so you can pick another stream if there's no sound.
+- **Which audio track plays first.** English when the file has it. A foreign title (judged by its main
+  country of production on Cinemeta, such as Japan or South Korea) plays in its original language with
+  English subtitles when the file has that language, so you get the sub, not the dub. Within the language
+  the best track wins: Atmos, then more channels, then Dolby Digital Plus, DTS, Dolby Digital, AAC.
+  Commentary and audio description are never picked first. A co-production listed under the wrong
+  country can pick the other language; Y and X change it.
 - Built for direct / debrid links. Torrent streams need a streaming server.
 
 ## 🚧 Work in progress (WIP)

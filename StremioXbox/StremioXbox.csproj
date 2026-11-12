@@ -60,6 +60,7 @@
     <Compile Include="MainPage.xaml.cs">
       <DependentUpon>MainPage.xaml</DependentUpon>
     </Compile>
+    <Compile Include="Core\AudioChoice.cs" />
     <Compile Include="Core\BufferedHttpStream.cs" />
     <Compile Include="Core\DisplayModeManager.cs" />
     <Compile Include="Core\FileLog.cs" />

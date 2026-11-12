@@ -342,3 +342,6 @@ healthchecksdb
 *.pfx
 *.cer
 .DS_Store
+
+# Xbox screenshots and logs saved by scripts/Get-XboxDiagnostics.ps1 (they include stream links)
+diagnostics/

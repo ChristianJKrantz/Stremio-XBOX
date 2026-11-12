@@ -73,21 +73,29 @@ namespace StremioXbox.Core
                 .Select(m => m.ResolutionHeightInRawPixels)
                 .DefaultIfEmpty(maxHeight)
                 .Min();
-            var sameResolution = candidates.Where(m => m.ResolutionHeightInRawPixels == atOrAbove);
+            var sameResolution = candidates.Where(m => m.ResolutionHeightInRawPixels == atOrAbove).ToList();
+            var currentRefresh = hdmi.GetCurrentDisplayMode()?.RefreshRate ?? 60;
+            var rates = string.Join(", ", sameResolution.Select(m => m.RefreshRate.ToString("0.###")).Distinct());
 
             IEnumerable<HdmiDisplayMode> ordered = MatchRefreshRate && frameRate > 1
-                ? sameResolution.OrderBy(m => RefreshPenalty(m.RefreshRate, frameRate))
-                : sameResolution.OrderBy(m => Math.Abs(m.RefreshRate - 60));
+                ? sameResolution.OrderBy(m => RefreshPenalty(m.RefreshRate, frameRate, currentRefresh))
+                : sameResolution.OrderBy(m => Math.Abs(m.RefreshRate - currentRefresh));
 
+            var refused = new List<string>();
             foreach (var mode in ordered)
             {
                 if (await hdmi.RequestSetCurrentDisplayModeAsync(mode, option))
                 {
-                    return "Display mode set: " + Describe(mode) + " " + option;
+                    var matched = MatchRefreshRate && frameRate > 1 && RefreshPenalty(mode.RefreshRate, frameRate, currentRefresh) < 100;
+                    return string.Format("Display mode set: {0} {1} for {2:0.###} fps ({3}; {4}p offers {5} Hz{6})",
+                        Describe(mode), option, frameRate, matched ? "matches the video" : "no rate fits the video, kept near " + currentRefresh.ToString("0.###") + " Hz",
+                        atOrAbove, rates, refused.Count > 0 ? "; refused " + string.Join(", ", refused) : string.Empty);
                 }
+
+                refused.Add(Describe(mode));
             }
 
-            return "Every display mode request was refused (" + option + ")";
+            return "Every display mode request was refused (" + option + "; " + string.Join(", ", refused) + ")";
         }
 
         /// <summary>Returns the display to the console's default mode.</summary>
@@ -134,20 +142,25 @@ namespace StremioXbox.Core
             }
         }
 
-        // Exact multiples of the frame rate avoid judder; prefer 1x, then 2x, and so on.
-        // The small difference term breaks ties, so a 24 fps file gets 24 Hz rather than 23.976 Hz.
-        private static double RefreshPenalty(double refreshRate, double frameRate)
+        // A refresh rate that is a whole multiple of the frame rate shows every frame for the same time.
+        // NTSC rates are 1000/1001 of the round ones (59.94 vs 60 Hz, 0.1 %), so they count as a multiple
+        // too, ranked after an exact one: 30 fps gets 30 or 60 Hz first, then 29.97 or 59.94 Hz.
+        // 0.2.3 and earlier allowed only 0.05 Hz, so on a TV offering 23.976/59.94 Hz a 30 fps file matched
+        // nothing and fell back to the rate nearest 30, 23.976 Hz, which drops every fifth frame (skipping).
+        // With no multiple at all, the console's current rate is kept rather than the nearest one.
+        private static double RefreshPenalty(double refreshRate, double frameRate, double currentRefresh)
         {
             for (var multiple = 1; multiple <= 5; multiple++)
             {
-                var difference = Math.Abs(refreshRate - (frameRate * multiple));
-                if (difference < 0.05)
+                var target = frameRate * multiple;
+                var difference = Math.Abs(refreshRate - target);
+                if (difference <= target * 0.0015)
                 {
-                    return multiple - 1 + difference;
+                    return (difference * 100) + ((multiple - 1) * 0.5);
                 }
             }
 
-            return 100 + Math.Abs(refreshRate - frameRate);
+            return 100 + Math.Abs(refreshRate - currentRefresh);
         }
 
         private static string Describe(HdmiDisplayMode mode)

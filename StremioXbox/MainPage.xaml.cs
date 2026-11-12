@@ -17,6 +17,9 @@ using Windows.System.Display;
 using Windows.UI.Core;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Hosting;
+using Windows.UI.Xaml.Media;
+using Windows.UI.Xaml.Media.Animation;
 using WebView2 = Microsoft.UI.Xaml.Controls.WebView2;
 
 namespace StremioXbox
@@ -28,6 +31,9 @@ namespace StremioXbox
     public sealed partial class MainPage : Page
     {
         private const string StremioUrl = "https://web.stremio.com/";
+
+        // On a PC (testing without an Xbox) the keyboard drives the app too; on Xbox only the controller does.
+        private static readonly bool IsXbox = Windows.System.Profile.AnalyticsInfo.VersionInfo.DeviceFamily == "Windows.Xbox";
         private const int VisibleLogLines = 40;
 
         // MF_MT_TRANSFER_FUNCTION: 15 = SMPTE ST 2084 (PQ / HDR10), 16 = HLG.
@@ -80,13 +86,74 @@ namespace StremioXbox
         private int _lastBackTick = Environment.TickCount - 1000;
         private bool _pageAtHome = true; // From shell.js route messages.
         private long _lastCacheBytes;
-        private int _subtitleChoice; // 0 = off, n = n-th subtitle track
         private string _osdMessage;
+
+        // Startup / connection screen.
+        private bool _pageShown;         // The first successful load hid the startup screen.
+        private bool _statusRetry;       // The connection error is up; A retries.
+        private CoreWebView2ProcessFailedKind? _pendingRecovery; // The page crashed during playback; recover when it ends.
+        private DispatcherTimer _toastTimer;
+
+        // Player loading screen and the Stremio session it belongs to (see shell.js).
+        private bool _preparing;         // Loading screen up, waiting for 'play' from the page.
+        private double _preparingSession;
+        private double _cancelledSession = -1;
+        private DateTime _preparingSince;
+        private volatile bool _starting; // Media opened, resuming / prebuffering before the first Play.
+        private string _contentType;     // Of the buffered source, to open it again for an audio switch.
+
+        // Audio switch to another format: the same file is opened again (from the RAM buffer) with the new
+        // track chosen before playback starts, then returns to where it was. Switching formats live crashed
+        // the player (E-AC3 -> AC3); within one format the switch stays live.
+        private bool _reopening;
+        private TimeSpan _reopenPosition;
+        private bool _reopenWasPaused;
+        private int _reopenFallback = -1; // Track to go back to if the new one fails to open.
+        private string _restoreSubtitle;  // Subtitle shown before the reopen ("" = off, null = nothing to do).
+        private volatile string _audioNote; // Set while choosing the first audio track, shown on the bar.
+        private bool _hasPlayed;         // Play was called: from here on the position is worth saving.
+        private DispatcherTimer _progressTimer;
+        private bool? _reportedPaused;
+        private int _lastProgressTick;
+        private string _nextLabel;       // Next episode, from Stremio; null when there is none.
+        private bool _binge = true;
+        private bool _upNextDismissed;
+        private bool _subtitleUserChoice;
+        private bool _subtitleAutoDone;
+
+        // D-pad / shoulder seeking: presses add up to a target that is applied once they stop.
+        private TimeSpan? _scrubTarget;
+        private int _scrubRepeats;
+        private int _lastScrubTick;
+        private DispatcherTimer _scrubTimer;
+
+        // Audio & Subtitles panel: two columns (audio, subtitles), each with its own highlighted row.
+        private readonly List<MenuEntry>[] _menuColumns = new List<MenuEntry>[2];
+        private readonly int[] _menuIndexes = new int[2];
+        private int _menuColumn;
+
+        // Stremio's intro timing for the current video, when it knows it.
+        private TimeSpan? _introFrom;
+        private TimeSpan? _introTo;
+        private bool _skipIntroDismissed;
 
         public MainPage()
         {
             InitializeComponent();
             Loaded += OnLoaded;
+            SetUpFades();
+
+            // The Skip intro / Up Next cards sit low in the corner and move up above the bar while it shows.
+            Osd.RegisterPropertyChangedCallback(VisibilityProperty, (sender, property) =>
+            {
+                if (Osd.Visibility != Visibility.Visible)
+                {
+                    SetCenterIndicator(null);
+                }
+
+                PositionCards();
+            });
+            Osd.SizeChanged += (sender, e) => PositionCards();
         }
 
         private async void OnLoaded(object sender, RoutedEventArgs e)
@@ -99,6 +166,9 @@ namespace StremioXbox
             _gamepad.Start();
             WatchKeyboard();
             ApplyCursorMode();
+            Application.Current.EnteredBackground += OnEnteredBackground;
+            Application.Current.LeavingBackground += OnLeavingBackground;
+            Windows.Networking.Connectivity.NetworkInformation.NetworkStatusChanged += OnNetworkStatusChanged;
 
             var version = Package.Current.Id.Version;
             Log("info", string.Format("Stremio-XBOX {0}.{1}.{2}", version.Major, version.Minor, version.Build));
@@ -125,9 +195,12 @@ namespace StremioXbox
             catch (Exception ex)
             {
                 Log("error", "WebView2 failed to start: " + ex.Message);
-                SetDebugVisible(true);
+                ShowStatus("Stremio couldn't start", "The Microsoft Edge WebView2 runtime failed to start (" + ex.Message + "). Restart the app; if it keeps happening, reinstall it with its Dependencies.", "View  Show log", false);
                 return;
             }
+
+            // A crashed page would otherwise leave a blank screen: reload it (after playback, if a video is on).
+            _webView.CoreWebView2.ProcessFailed += (sender, args) => _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => OnWebProcessFailed(args.ProcessFailedKind));
 
             var settings = _webView.CoreWebView2.Settings;
             settings.AreDefaultContextMenusEnabled = false;
@@ -171,6 +244,7 @@ namespace StremioXbox
 
         private void StartRequestLogging()
         {
+            _requestTimer?.Stop(); // The WebView2 may be recreated after a crash.
             var core = _webView.CoreWebView2;
             try
             {
@@ -354,7 +428,24 @@ namespace StremioXbox
             SaveSetting("cursorMode", enabled);
             ApplyCursorMode();
             Log("info", "Cursor " + (enabled ? "on (left stick moves, A clicks, right stick scrolls, stick click turns it off)" : "off"));
+            if (!enabled)
+            {
+                MoveMouseAway();
+            }
+
             UpdateDebugHeader();
+        }
+
+        // The page keeps a hover where the app's cursor last was, so after the cursor is turned off, Stremio's
+        // white hover highlight stayed on that spot and moved onto whatever scrolled under it: a second
+        // highlight next to the controller's. Moving the (virtual) mouse off the page clears it.
+        private void MoveMouseAway()
+        {
+            var core = _webView?.CoreWebView2;
+            if (core != null && !_systemCursor)
+            {
+                _ = SendDevToolsAsync(core, "Input.dispatchMouseEvent", "{\"type\":\"mouseMoved\",\"x\":-1,\"y\":-1,\"button\":\"none\"}");
+            }
         }
 
         private void ApplyCursorMode()
@@ -576,12 +667,128 @@ namespace StremioXbox
                     _ = PrimeTypingAsync(0, "page loaded", false);
                 }
                 _ = ApplyZoomAsync();
+                _statusRetry = false;
+                _pageShown = true;
+                StatusLayer.Visibility = Visibility.Collapsed;
+            }
+            else if (args.WebErrorStatus == CoreWebView2WebErrorStatus.OperationCanceled)
+            {
+                Log("info", "Navigation replaced before it finished");
             }
             else
             {
                 Log("error", "Navigation failed: " + args.WebErrorStatus);
-                SetDebugVisible(true);
+                ShowStatus("Can't reach Stremio", "Check that your Xbox is connected to the internet. (" + args.WebErrorStatus + ")", "A  Try again", false);
+                _statusRetry = true;
             }
+        }
+
+        // ---- Startup / connection screen, toasts ----------------------------------------------------
+        private void ShowStatus(string title, string text, string hint, bool busy)
+        {
+            StatusTitle.Text = title;
+            StatusText.Text = text ?? string.Empty;
+            StatusText.Visibility = string.IsNullOrEmpty(text) ? Visibility.Collapsed : Visibility.Visible;
+            StatusHint.Text = hint ?? string.Empty;
+            StatusHint.Visibility = string.IsNullOrEmpty(hint) ? Visibility.Collapsed : Visibility.Visible;
+            StatusRing.IsActive = busy;
+            StatusRing.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
+            StatusLayer.Visibility = Visibility.Visible;
+        }
+
+        private void RetryPage(string reason)
+        {
+            if (_webView?.CoreWebView2 == null)
+            {
+                return;
+            }
+
+            Log("info", "Reloading Stremio (" + reason + ")");
+            _statusRetry = false;
+            ShowStatus(_pageShown ? "Reloading Stremio" : "Loading Stremio", null, null, true);
+            _typingReady = false;
+            _webView.CoreWebView2.Navigate(StremioUrl);
+        }
+
+        private void OnNetworkStatusChanged(object sender)
+        {
+            _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+            {
+                var profile = Windows.Networking.Connectivity.NetworkInformation.GetInternetConnectionProfile();
+                var online = profile != null && profile.GetNetworkConnectivityLevel() == Windows.Networking.Connectivity.NetworkConnectivityLevel.InternetAccess;
+                if (_statusRetry && online)
+                {
+                    RetryPage("back online");
+                }
+            });
+        }
+
+        private void OnWebProcessFailed(CoreWebView2ProcessFailedKind kind)
+        {
+            Log("error", "WebView2 process failed: " + kind);
+            if (kind != CoreWebView2ProcessFailedKind.BrowserProcessExited &&
+                kind != CoreWebView2ProcessFailedKind.RenderProcessExited &&
+                kind != CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
+            {
+                return; // A helper process (GPU, utility) restarts by itself.
+            }
+
+            if (PlayerLayer.Visibility == Visibility.Visible)
+            {
+                _pendingRecovery = kind; // Keep the video going; the page is hidden anyway.
+                return;
+            }
+
+            _ = RecoverPageAsync(kind);
+        }
+
+        private async Task RecoverPageAsync(CoreWebView2ProcessFailedKind kind)
+        {
+            _pendingRecovery = null;
+            if (kind != CoreWebView2ProcessFailedKind.BrowserProcessExited)
+            {
+                RetryPage("page crashed");
+                return;
+            }
+
+            // The whole browser is gone: the control cannot be reused.
+            ShowStatus("Reloading Stremio", null, null, true);
+            var old = _webView;
+            _webView = null;
+            if (old != null)
+            {
+                RootGrid.Children.Remove(old);
+                try
+                {
+                    old.Close();
+                }
+                catch (Exception ex)
+                {
+                    Log("warn", "Closing the old WebView2 failed: " + ex.Message);
+                }
+            }
+
+            _typingReady = false;
+            await InitializeWebViewAsync();
+        }
+
+        private void ShowToast(string text, double seconds = 6)
+        {
+            if (_toastTimer == null)
+            {
+                _toastTimer = new DispatcherTimer();
+                _toastTimer.Tick += (sender, e) =>
+                {
+                    _toastTimer.Stop();
+                    Toast.Visibility = Visibility.Collapsed;
+                };
+            }
+
+            ToastText.Text = text;
+            Toast.Visibility = Visibility.Visible;
+            _toastTimer.Stop();
+            _toastTimer.Interval = TimeSpan.FromSeconds(seconds);
+            _toastTimer.Start();
         }
 
         private void OnWebMessageReceived(WebView2 sender, CoreWebView2WebMessageReceivedEventArgs args)
@@ -609,8 +816,42 @@ namespace StremioXbox
                 case "log":
                     Log(message.GetNamedString("level", "info"), "web: " + message.GetNamedString("text", string.Empty));
                     break;
+                case "preparing":
+                    ShowPreparing(message.GetNamedNumber("session", 0), "Loading", message.GetNamedString("name", string.Empty).Replace("\n", " "));
+                    break;
                 case "play":
-                    StartNativePlayback(PlayRequest.FromJson(message));
+                    var request = PlayRequest.FromJson(message);
+                    if (request.Session != 0 && request.Session == _cancelledSession)
+                    {
+                        Log("info", "Ignoring a stream that was cancelled while loading");
+                        break;
+                    }
+
+                    StartNativePlayback(request);
+                    break;
+                case "nextInfo":
+                    if (_current != null && message.GetNamedNumber("session", 0) == _current.Session)
+                    {
+                        SetNextLabel(message.GetNamedString("next", string.Empty));
+                    }
+
+                    break;
+                case "introInfo":
+                    if (_current != null && message.GetNamedNumber("session", 0) == _current.Session)
+                    {
+                        ApplyIntro(message.GetNamedNumber("introFrom", 0), message.GetNamedNumber("introTo", 0));
+                        UpdateSkipIntro();
+                    }
+
+                    break;
+                case "playerIdle":
+                    // The page did not start another video (no next episode, or it opened its stream list).
+                    if (_preparing && _mediaPlayer == null)
+                    {
+                        _preparing = false;
+                        StopPlayback(resetDisplay: true);
+                    }
+
                     break;
                 case "textFocus":
                     _ = PrimeTypingAsync(message.GetNamedNumber("id", 0), "field focused by page", false);
@@ -630,6 +871,7 @@ namespace StremioXbox
             {
                 ["type"] = JsonValue.CreateStringValue("config"),
                 ["nativePlayer"] = JsonValue.CreateBooleanValue(_nativePlayerEnabled),
+                ["keyboardNav"] = JsonValue.CreateBooleanValue(!IsXbox),
             };
 
             try
@@ -655,6 +897,28 @@ namespace StremioXbox
             Log("info", "Stream URL: " + request.Url);
             _fileSize = 0;
             _bitrateLogged = false;
+            _preparing = false;
+            _starting = true;
+            _hasPlayed = false;
+            Player.Opacity = 1; // A playback closed during its restart seek leaves the picture hidden.
+            _reportedPaused = null;
+            _upNextDismissed = false;
+            _skipIntroDismissed = false;
+            ApplyIntro(request.IntroFromMs, request.IntroToMs);
+            _subtitleUserChoice = false;
+            _subtitleAutoDone = string.IsNullOrEmpty(request.SubtitlesLanguage);
+            _reopening = false;
+            _reopenFallback = -1;
+            _restoreSubtitle = null;
+            _audioNote = null;
+            _contentType = null;
+            _binge = request.Binge;
+            _nextLabel = string.IsNullOrEmpty(request.Next) ? null : request.Next;
+            LoadingTitle.Text = request.DisplayTitle;
+            LoadingText.Text = request.StartPositionMs > 0
+                ? "Resuming from " + FormatTime(TimeSpan.FromMilliseconds(request.StartPositionMs))
+                : request.DisplaySubtitle;
+            SetBackdrop(request.Background);
             if (request.HasRequestHeaders)
             {
                 Log("warn", "This stream asks for custom request headers; the native player does not send them yet.");
@@ -670,10 +934,22 @@ namespace StremioXbox
             _mediaPlayer.MediaEnded += OnMediaEnded;
             _mediaPlayer.PlaybackSession.BufferingStarted += OnBufferingStarted;
             _mediaPlayer.PlaybackSession.BufferingEnded += OnBufferingEnded;
+            _mediaPlayer.PlaybackSession.PlaybackStateChanged += OnPlaybackStateChanged;
+            SetUpRemoteCommands(_mediaPlayer);
 
             Player.SetMediaPlayer(_mediaPlayer);
+            ShowPlayerLayer();
+            UpdateLoading();
+            StartProgressTimer();
+
+            _ = OpenSourceAsync(request, _mediaPlayer);
+        }
+
+        private void ShowPlayerLayer()
+        {
             PlayerLayer.Visibility = Visibility.Visible;
             _typingReady = false; // The page loses focus to the player; set typing up again afterwards.
+            CursorLayer.Visibility = Visibility.Collapsed;
 
             // Hide Stremio Web during native playback so the page stops rendering behind the video.
             if (_webView != null)
@@ -681,8 +957,396 @@ namespace StremioXbox
                 _webView.Visibility = Visibility.Collapsed;
             }
 
-            _ = OpenSourceAsync(request, _mediaPlayer);
             Player.Focus(FocusState.Programmatic);
+        }
+
+        // The player screen comes up as soon as a stream is picked; the page sends 'play' once Stremio's
+        // title, resume position and subtitles are known (a few seconds at most).
+        private void ShowPreparing(double session, string title, string text)
+        {
+            if (!_nativePlayerEnabled)
+            {
+                return;
+            }
+
+            if (_mediaPlayer != null)
+            {
+                StopPlayback(resetDisplay: false);
+            }
+
+            _preparing = true;
+            _preparingSession = session;
+            _preparingSince = DateTime.UtcNow;
+            _current = null;
+            LoadingTitle.Text = title;
+            LoadingText.Text = text ?? string.Empty;
+            SetBackdrop(null);
+            Osd.Visibility = Visibility.Collapsed;
+            UpNext.Visibility = Visibility.Collapsed;
+            SkipIntro.Visibility = Visibility.Collapsed;
+            CloseMenu();
+            ShowPlayerLayer();
+            UpdateLoading();
+            StartProgressTimer();
+        }
+
+        private void SetBackdrop(string url)
+        {
+            try
+            {
+                Player.PosterSource = !string.IsNullOrEmpty(url) && Uri.TryCreate(url, UriKind.Absolute, out var uri) && (uri.Scheme == "https" || uri.Scheme == "http")
+                    ? new Windows.UI.Xaml.Media.Imaging.BitmapImage(uri)
+                    : null;
+            }
+            catch (Exception ex)
+            {
+                Player.PosterSource = null;
+                Log("warn", "Backdrop failed: " + ex.Message);
+            }
+        }
+
+        // Spinner while the page prepares the stream, while resuming / prebuffering, and on rebuffering.
+        private void UpdateLoading()
+        {
+            var state = MediaPlaybackState.None;
+            try
+            {
+                state = _mediaPlayer?.PlaybackSession?.PlaybackState ?? MediaPlaybackState.None;
+            }
+            catch (Exception)
+            {
+            }
+
+            var show = _preparing || _starting || state == MediaPlaybackState.Buffering || state == MediaPlaybackState.Opening;
+            if (show && !_preparing && !_starting)
+            {
+                LoadingText.Text = "Buffering";
+            }
+
+            LoadingPanel.Visibility = show && PlayerLayer.Visibility == Visibility.Visible ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private void OnPlaybackStateChanged(MediaPlaybackSession sender, object args)
+        {
+            _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+            {
+                if (_mediaPlayer?.PlaybackSession != sender)
+                {
+                    return;
+                }
+
+                UpdateLoading();
+                ReportProgress(force: true);
+                if (Osd.Visibility == Visibility.Visible)
+                {
+                    UpdateOsd();
+                }
+            });
+        }
+
+        // ---- Session events for the page (Stremio's library, Continue Watching, next episode) ----------
+        private void PostPlayerEvent(string name, bool withTimes)
+        {
+            var session = _current?.Session ?? _preparingSession;
+            var message = new JsonObject
+            {
+                ["type"] = JsonValue.CreateStringValue("player"),
+                ["event"] = JsonValue.CreateStringValue(name),
+                ["session"] = JsonValue.CreateNumberValue(session),
+            };
+
+            var playback = _mediaPlayer?.PlaybackSession;
+            if (withTimes && playback != null && _hasPlayed)
+            {
+                try
+                {
+                    var position = _reopening ? _reopenPosition : (_scrubTarget ?? playback.Position);
+                    message["time"] = JsonValue.CreateNumberValue(Math.Round(position.TotalMilliseconds));
+                    message["duration"] = JsonValue.CreateNumberValue(Math.Round(playback.NaturalDuration.TotalMilliseconds));
+                    message["paused"] = JsonValue.CreateBooleanValue(playback.PlaybackState != MediaPlaybackState.Playing);
+                }
+                catch (Exception ex)
+                {
+                    Log("warn", "Could not read the position: " + ex.GetType().Name);
+                }
+            }
+
+            try
+            {
+                _webView?.CoreWebView2?.PostWebMessageAsString(message.Stringify());
+            }
+            catch (Exception ex)
+            {
+                Log("warn", "Could not send " + name + " to the page: " + ex.Message);
+            }
+        }
+
+        private void StartProgressTimer()
+        {
+            if (_progressTimer == null)
+            {
+                _progressTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+                _progressTimer.Tick += (sender, e) => OnProgressTick();
+            }
+
+            _progressTimer.Start();
+        }
+
+        private void OnProgressTick()
+        {
+            if (_preparing && _mediaPlayer == null)
+            {
+                // The page normally answers within a few seconds; never leave the viewer on a spinner.
+                if (DateTime.UtcNow - _preparingSince > TimeSpan.FromSeconds(45))
+                {
+                    Log("warn", "No stream from the page after 45 s");
+                    PostPlayerEvent("cancel", false);
+                    _cancelledSession = _preparingSession;
+                    _preparing = false;
+                    StopPlayback(resetDisplay: true);
+                    ShowToast("The stream didn't load. Try again or pick another stream.");
+                }
+
+                return;
+            }
+
+            UpdateLoading();
+            ReportProgress(force: false);
+            UpdateUpNext();
+            UpdateSkipIntro();
+        }
+
+        // Every 10 s while playing (Stremio's own player reports more often, but only the latest value is
+        // kept), and at once on pause/play changes.
+        private void ReportProgress(bool force)
+        {
+            var playback = _mediaPlayer?.PlaybackSession;
+            if (playback == null || !_hasPlayed || _starting)
+            {
+                return;
+            }
+
+            bool paused;
+            try
+            {
+                paused = playback.PlaybackState != MediaPlaybackState.Playing;
+            }
+            catch (Exception)
+            {
+                return;
+            }
+
+            if (paused && playback.PlaybackState == MediaPlaybackState.Buffering)
+            {
+                return; // Buffering is not a pause.
+            }
+
+            var due = unchecked(Environment.TickCount - _lastProgressTick) >= 10000;
+            if ((force && paused != _reportedPaused) || (due && (!paused || _reportedPaused != true)))
+            {
+                _reportedPaused = paused;
+                _lastProgressTick = Environment.TickCount;
+                PostPlayerEvent("progress", true);
+            }
+        }
+
+        // ---- Next episode -------------------------------------------------------------------------------
+        private void SetNextLabel(string label)
+        {
+            _nextLabel = string.IsNullOrEmpty(label) ? null : label;
+            Log("info", "Next episode: " + (_nextLabel ?? "none"));
+            if (_mediaPlayer != null)
+            {
+                _mediaPlayer.CommandManager.NextBehavior.EnablingRule = _nextLabel != null ? MediaCommandEnablingRule.Always : MediaCommandEnablingRule.Never;
+            }
+
+            UpdateUpNext();
+        }
+
+        // Stremio's "next video" card: the last 40 s of an episode, while a next episode exists.
+        private void UpdateUpNext()
+        {
+            var visible = false;
+            var playback = _mediaPlayer?.PlaybackSession;
+            if (playback != null && _nextLabel != null && !_upNextDismissed && _hasPlayed && !_starting && _scrubTarget == null && TrackMenu.Visibility != Visibility.Visible)
+            {
+                try
+                {
+                    var duration = playback.NaturalDuration;
+                    visible = duration > TimeSpan.FromMinutes(2) && duration - playback.Position <= TimeSpan.FromSeconds(40);
+                }
+                catch (Exception)
+                {
+                }
+            }
+
+            if (visible)
+            {
+                UpNextTitle.Text = _nextLabel;
+                UpNextHint.Text = _binge ? "Plays automatically   A  Play now   B  Hide" : "A  Play now   B  Hide";
+            }
+
+            UpNext.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        // ---- Skip intro --------------------------------------------------------------------------------
+        private void ApplyIntro(double fromMs, double toMs)
+        {
+            if (toMs > fromMs && toMs > 0)
+            {
+                _introFrom = TimeSpan.FromMilliseconds(Math.Max(0, fromMs));
+                _introTo = TimeSpan.FromMilliseconds(toMs);
+                Log("info", "Intro: " + FormatTime(_introFrom.Value) + " to " + FormatTime(_introTo.Value));
+            }
+            else
+            {
+                _introFrom = null;
+                _introTo = null;
+            }
+        }
+
+        // Stremio's "Skip intro" button: shown while playback is inside the intro Stremio knows about.
+        private void UpdateSkipIntro()
+        {
+            var visible = false;
+            var playback = _mediaPlayer?.PlaybackSession;
+            if (playback != null && _introFrom.HasValue && _introTo.HasValue && !_skipIntroDismissed && _hasPlayed && !_starting &&
+                _scrubTarget == null && TrackMenu.Visibility != Visibility.Visible)
+            {
+                try
+                {
+                    var position = playback.Position;
+                    visible = position >= _introFrom.Value && position < _introTo.Value - TimeSpan.FromSeconds(2);
+                }
+                catch (Exception)
+                {
+                }
+            }
+
+            SkipIntro.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private void SkipIntroNow()
+        {
+            if (_mediaPlayer?.PlaybackSession == null || !_introTo.HasValue)
+            {
+                return;
+            }
+
+            _skipIntroDismissed = true;
+            SkipIntro.Visibility = Visibility.Collapsed;
+            Log("info", "Skip intro");
+            _scrubTarget = _introTo.Value;
+            CommitScrub();
+        }
+
+        private void PlayNext()
+        {
+            if (_mediaPlayer == null || _nextLabel == null)
+            {
+                return;
+            }
+
+            Log("info", "Next episode requested: " + _nextLabel);
+            PostPlayerEvent("next", true);
+            var label = _nextLabel;
+            var session = _current?.Session ?? 0;
+            StopPlayback(resetDisplay: false);
+            ShowPreparing(session, label, "Finding the next stream");
+        }
+
+        // ---- Xbox media remote / system media controls --------------------------------------------------
+        private void SetUpRemoteCommands(MediaPlayer player)
+        {
+            try
+            {
+                var commands = player.CommandManager;
+                commands.IsEnabled = true;
+                commands.NextBehavior.EnablingRule = _nextLabel != null ? MediaCommandEnablingRule.Always : MediaCommandEnablingRule.Never;
+                commands.FastForwardBehavior.EnablingRule = MediaCommandEnablingRule.Always;
+                commands.RewindBehavior.EnablingRule = MediaCommandEnablingRule.Always;
+                commands.NextReceived += (sender, args) =>
+                {
+                    args.Handled = true;
+                    _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+                    {
+                        if (player == _mediaPlayer)
+                        {
+                            PlayNext();
+                        }
+                    });
+                };
+                commands.FastForwardReceived += (sender, args) =>
+                {
+                    args.Handled = true;
+                    _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => RemoteSeek(player, 30));
+                };
+                commands.RewindReceived += (sender, args) =>
+                {
+                    args.Handled = true;
+                    _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => RemoteSeek(player, -10));
+                };
+            }
+            catch (Exception ex)
+            {
+                Log("warn", "Media remote commands unavailable: " + ex.Message);
+            }
+        }
+
+        private void RemoteSeek(MediaPlayer player, double seconds)
+        {
+            if (player == _mediaPlayer && !_starting)
+            {
+                Scrub(player.PlaybackSession, seconds, accelerate: false);
+            }
+        }
+
+        private static void ApplyDisplayProperties(MediaPlaybackItem item, PlayRequest request)
+        {
+            var props = item.GetDisplayProperties();
+            props.Type = Windows.Media.MediaPlaybackType.Video;
+            props.VideoProperties.Title = request.DisplayTitle;
+            props.VideoProperties.Subtitle = request.DisplaySubtitle;
+            item.ApplyDisplayProperties(props);
+        }
+
+        // ---- App leaves the screen (Home button, another app) ------------------------------------------
+        private void OnEnteredBackground(object sender, Windows.ApplicationModel.EnteredBackgroundEventArgs e)
+        {
+            var deferral = e.GetDeferral();
+            _ = Dispatcher.RunAsync(CoreDispatcherPriority.High, () =>
+            {
+                try
+                {
+                    if (_mediaPlayer != null && !_starting && _mediaPlayer.PlaybackSession.PlaybackState == MediaPlaybackState.Playing)
+                    {
+                        CommitScrub();
+                        _mediaPlayer.Pause();
+                        Log("info", "Paused: app went to the background");
+                    }
+
+                    if (_hasPlayed)
+                    {
+                        _reportedPaused = true;
+                        PostPlayerEvent("progress", true); // Save the position in case the app is not resumed.
+                    }
+                }
+                finally
+                {
+                    deferral.Complete();
+                }
+            });
+        }
+
+        private void OnLeavingBackground(object sender, Windows.ApplicationModel.LeavingBackgroundEventArgs e)
+        {
+            _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+            {
+                if (_mediaPlayer != null)
+                {
+                    ShowOsd(); // Shows "Paused" and how to continue.
+                }
+            });
         }
 
         // Resolves the addon URL (redirects, size), then either feeds the player from the app's own
@@ -704,6 +1368,7 @@ namespace StremioXbox
                 {
                     var ahead = PickReadAheadBytes();
                     _cache = new HttpChunkCache(request.Url, probe.FinalUrl, probe.Size, _connections, ahead, LogAsync);
+                    _contentType = contentType;
                     _lastCacheBytes = 0;
                     source = MediaSource.CreateFromStream(new BufferedHttpStream(_cache, 0), contentType);
                     Log("info", string.Format("Buffered playback: {0} connections, {1} MB read-ahead, {2}", _connections, ahead >> 20, contentType));
@@ -715,26 +1380,254 @@ namespace StremioXbox
                     source = MediaSource.CreateFromUri(new Uri(request.Url));
                 }
 
-                if (_attachSubtitles)
-                {
-                    AddExternalSubtitles(source, request);
-                }
-                else
-                {
-                    Log("info", "External subtitles: off (" + request.Subtitles.Count + " available)");
-                }
-
-                var item = new MediaPlaybackItem(source);
-                item.TimedMetadataTracksChanged += (sender2, args2) => _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => LogSubtitleTracks(sender2));
-                _subtitleChoice = 0;
-                player.Source = item;
+                player.Source = CreatePlaybackItem(request, source, -1);
             }
             catch (Exception ex)
             {
+                if (player != _mediaPlayer)
+                {
+                    return;
+                }
+
                 Log("error", "Could not open stream: " + ex.Message);
-                StopPlayback(resetDisplay: true);
-                SetDebugVisible(true);
+                FailPlayback("Couldn't open this stream (" + ex.Message + "). Try another stream.");
             }
+        }
+
+        private MediaPlaybackItem CreatePlaybackItem(PlayRequest request, MediaSource source, int audioIndex)
+        {
+            if (_attachSubtitles)
+            {
+                AddExternalSubtitles(source, request);
+            }
+            else
+            {
+                Log("info", "External subtitles: off (" + request.Subtitles.Count + " available)");
+            }
+
+            var item = new MediaPlaybackItem(source);
+
+            // Tracks appear while the file opens, before playback: the place to pick the audio track
+            // without switching formats under a running player.
+            item.AudioTracksChanged += (sender2, args2) => SelectInitialAudio(sender2, request, audioIndex);
+            item.TimedMetadataTracksChanged += (sender2, args2) => _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+            {
+                LogSubtitleTracks(sender2);
+                AutoSelectSubtitles(sender2);
+            });
+            try
+            {
+                ApplyDisplayProperties(item, request);
+            }
+            catch (Exception ex)
+            {
+                Log("warn", "Media info for the system controls failed: " + ex.Message);
+            }
+
+            return item;
+        }
+
+        // Runs on a media thread while the file opens. audioIndex >= 0: the track asked for in an audio switch.
+        private void SelectInitialAudio(MediaPlaybackItem item, PlayRequest request, int audioIndex)
+        {
+            if (!_starting)
+            {
+                return; // Never switch under a running player.
+            }
+
+            try
+            {
+                var tracks = item.AudioTracks;
+                if (tracks.Count == 0)
+                {
+                    return;
+                }
+
+                var pick = audioIndex >= 0 ? audioIndex : PickAudioTrack(tracks, request.AudioLanguage);
+                if (pick < 0 || pick >= tracks.Count)
+                {
+                    return;
+                }
+
+                var current = tracks.SelectedIndex;
+                if (pick != current)
+                {
+                    tracks.SelectedIndex = pick;
+                }
+
+                var chosen = tracks[pick];
+                if (audioIndex < 0)
+                {
+                    var before = current >= 0 && current < tracks.Count ? tracks[current] : null;
+                    if (before != null && pick != current && IsTrueHd(before) && !IsTrueHd(chosen))
+                    {
+                        _audioNote = "Audio: " + AudioFormatName(chosen) + " instead of Dolby TrueHD (often silent on Xbox) · Y to change";
+                    }
+                    else if (IsTrueHd(chosen))
+                    {
+                        _audioNote = "Dolby TrueHD can be silent on Xbox. No sound? Press Y for another track, or pick another stream";
+                    }
+                }
+
+                LogAsync("info", string.Format("Audio track {0}/{1}: {2}{3}", pick + 1, tracks.Count, DescribeAudio(chosen),
+                    pick != current ? " (default was " + (current + 1) + (audioIndex >= 0 ? ", audio switch)" : ")") : string.Empty));
+            }
+            catch (Exception ex)
+            {
+                LogAsync("warn", "Choosing the audio track failed: " + ex.Message);
+            }
+        }
+
+        // Stremio's audio language when the file has it, else the file's default language; within that
+        // language, a format the Xbox plays reliably (TrueHD is often silent), then the default track, and
+        // never a commentary over the main track.
+        private static int PickAudioTrack(IReadOnlyList<AudioTrack> tracks, string preferredLanguage)
+        {
+            var current = 0; // The platform starts on the container's default track, listed first.
+            string language = null;
+            if (!string.IsNullOrEmpty(preferredLanguage))
+            {
+                for (var i = 0; i < tracks.Count; i++)
+                {
+                    if (LanguageMatches(tracks[i].Language, preferredLanguage))
+                    {
+                        language = NormalizeLanguage(tracks[i].Language);
+                        break;
+                    }
+                }
+            }
+
+            language = language ?? NormalizeLanguage(tracks[current].Language);
+            var best = current;
+            var bestScore = int.MinValue;
+            for (var i = 0; i < tracks.Count; i++)
+            {
+                if (NormalizeLanguage(tracks[i].Language) != language)
+                {
+                    continue;
+                }
+
+                var score = (IsTrueHd(tracks[i]) ? 0 : 4) + (i == current ? 2 : 0) - (IsCommentary(tracks[i]) ? 8 : 0);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = i;
+                }
+            }
+
+            return best;
+        }
+
+        private static bool IsTrueHd(AudioTrack track)
+        {
+            var subtype = (track.GetEncodingProperties().Subtype ?? string.Empty).ToUpperInvariant();
+            var label = (track.Label ?? string.Empty).ToUpperInvariant();
+
+            // MEDIASUBTYPE_DOLBY_TRUEHD has no WinRT name; the subtype then reads as its GUID.
+            return subtype.Contains("TRUEHD") || subtype.Contains("MLP") || subtype.Contains("EB27CEC4-163E-4CA3-8B74-8E25F91B517E") ||
+                label.Contains("TRUEHD") || label.Contains("TRUE HD");
+        }
+
+        private static bool IsCommentary(AudioTrack track)
+        {
+            return (track.Label ?? string.Empty).IndexOf("comment", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // Live when the format stays the same; otherwise reopen the file with the new track (see _reopening).
+        private void SwitchAudioTrack(MediaPlaybackItem item, int index, string label)
+        {
+            var tracks = item.AudioTracks;
+            var current = tracks.SelectedIndex;
+            if (index == current || index < 0 || index >= tracks.Count)
+            {
+                return;
+            }
+
+            if (current >= 0 && AudioFormatName(tracks[current]) == AudioFormatName(tracks[index]))
+            {
+                tracks.SelectedIndex = index;
+                _osdMessage = "Audio: " + label;
+                Log("info", "Audio track " + (index + 1) + "/" + tracks.Count + " (same format, live): " + label);
+                return;
+            }
+
+            ReopenWithAudio(index, current, label);
+        }
+
+        private void ReopenWithAudio(int index, int previous, string label)
+        {
+            var player = _mediaPlayer;
+            if (player == null || _current == null)
+            {
+                return;
+            }
+
+            var session = player.PlaybackSession;
+            var oldItem = player.Source as MediaPlaybackItem;
+            _scrubTimer?.Stop();
+            if (!_reopening)
+            {
+                _reopenPosition = _scrubTarget ?? session.Position;
+                _reopenWasPaused = session.PlaybackState != MediaPlaybackState.Playing;
+                _restoreSubtitle = oldItem != null ? CurrentSubtitleLabel(oldItem) : null;
+            }
+
+            _scrubTarget = null;
+            _reopenFallback = previous;
+            _reopening = true;
+            _starting = true;
+            _osdMessage = "Audio: " + label;
+            LoadingTitle.Text = _current.DisplayTitle;
+            LoadingText.Text = "Switching audio to " + label;
+            Osd.Visibility = Visibility.Collapsed;
+            UpNext.Visibility = Visibility.Collapsed;
+            SkipIntro.Visibility = Visibility.Collapsed;
+            UpdateLoading();
+            Log("info", "Audio switch to another format: reopening at " + FormatTime(_reopenPosition) + " with track " + (index + 1) + " (" + label + ")");
+
+            try
+            {
+                player.Pause();
+                var source = _cache != null && _contentType != null
+                    ? MediaSource.CreateFromStream(new BufferedHttpStream(_cache, 0, "audio switch"), _contentType)
+                    : MediaSource.CreateFromUri(new Uri(_current.Url));
+                player.Source = CreatePlaybackItem(_current, source, index);
+            }
+            catch (Exception ex)
+            {
+                Log("error", "Audio switch failed: " + ex.Message);
+                FailPlayback("Couldn't switch the audio track (" + ex.Message + ").");
+            }
+        }
+
+        private static string CurrentSubtitleLabel(MediaPlaybackItem item)
+        {
+            var tracks = item.TimedMetadataTracks;
+            for (var i = 0; i < tracks.Count; i++)
+            {
+                if (IsSubtitleTrack(tracks[i]) && tracks.GetPresentationMode((uint)i) != TimedMetadataTrackPresentationMode.Disabled)
+                {
+                    return DescribeSubtitle(tracks[i]);
+                }
+            }
+
+            return string.Empty;
+        }
+
+        private void AddOsdNote(string note)
+        {
+            if (!string.IsNullOrEmpty(note))
+            {
+                _osdMessage = string.IsNullOrEmpty(_osdMessage) ? note : _osdMessage + "   ·   " + note;
+            }
+        }
+
+        // Stays in the app: a message instead of the debug log, and Stremio's stream list to pick another.
+        private void FailPlayback(string message)
+        {
+            PostPlayerEvent("failed", false);
+            StopPlayback(resetDisplay: true);
+            ShowToast(message, 8);
         }
 
         // Leaves room for the app (about 1.3 GB during 4K playback) inside the console's memory budget.
@@ -780,22 +1673,62 @@ namespace StremioXbox
             return Regex.IsMatch(text, @"(?<![a-z])(hdr|hdr10|hdr10\+|dv|dovi|dolby.?vision)(?![a-z])", RegexOptions.IgnoreCase);
         }
 
+        private static bool NameSaysDolbyVision(PlayRequest request)
+        {
+            if (request == null)
+            {
+                return false;
+            }
+
+            var text = string.Join(" ", request.FileName, request.Description, request.Name);
+            return Regex.IsMatch(text, @"(?<![a-z])(dv|dovi|dolby.?vision)(?![a-z])", RegexOptions.IgnoreCase);
+        }
+
         // Logs (0.1.3.5) show the player reading a second position far ahead of playback, and playback
         // slowing whenever that read waits; a manual +60 s then back during playback removed it every time,
         // while the same seek done before playing (0.1.3.7) did not hold on every file.
-        private async Task RestartSeekBeforePlayAsync(MediaPlayer player, int seconds)
+        private async Task RestartSeekBeforePlayAsync(MediaPlayer player, int seconds, TimeSpan origin)
         {
             var session = player.PlaybackSession;
-            if (_cache == null || !session.CanSeek || session.NaturalDuration < TimeSpan.FromSeconds(seconds + 60))
+            if (_cache == null || !session.CanSeek || session.NaturalDuration < origin + TimeSpan.FromSeconds(seconds + 60))
             {
                 return;
             }
 
             var watch = Stopwatch.StartNew();
-            var forward = await SeekAndWaitAsync(session, TimeSpan.FromSeconds(seconds));
-            var back = await SeekAndWaitAsync(session, TimeSpan.Zero);
-            Log(forward && back ? "info" : "warn", string.Format("Restart seek before play (+{0} s, then 0:00) {1} in {2} ms",
-                seconds, forward && back ? "done" : "timed out", watch.ElapsedMilliseconds));
+            var forward = await SeekAndWaitAsync(session, origin + TimeSpan.FromSeconds(seconds));
+            var back = await SeekAndWaitAsync(session, origin);
+            Log(forward && back ? "info" : "warn", string.Format("Restart seek before play (+{0} s, then {1:hh\\:mm\\:ss}) {2} in {3} ms",
+                seconds, origin, forward && back ? "done" : "timed out", watch.ElapsedMilliseconds));
+        }
+
+        // Where Stremio's library says this video was left; ignored when it is (almost) at the end.
+        private async Task<TimeSpan> ResumeAsync(MediaPlayer player)
+        {
+            var session = player.PlaybackSession;
+            if (_reopening)
+            {
+                if (_reopenPosition > TimeSpan.Zero && session.CanSeek)
+                {
+                    var back = await SeekAndWaitAsync(session, _reopenPosition, true);
+                    Log(back ? "info" : "warn", "Audio switch: back at " + FormatTime(_reopenPosition) + (back ? string.Empty : " (seek timed out)"));
+                }
+
+                return _reopenPosition;
+            }
+
+            var target = TimeSpan.FromMilliseconds(_current?.StartPositionMs ?? 0);
+            var duration = session.NaturalDuration;
+            if (target < TimeSpan.FromSeconds(5) || !session.CanSeek || (duration > TimeSpan.Zero && target > duration - TimeSpan.FromSeconds(60)))
+            {
+                return TimeSpan.Zero;
+            }
+
+            var watch = Stopwatch.StartNew();
+            var done = await SeekAndWaitAsync(session, target, true);
+            Log(done ? "info" : "warn", string.Format("Resume at {0:hh\\:mm\\:ss} {1} in {2} ms", target, done ? "done" : "timed out", watch.ElapsedMilliseconds));
+            AddOsdNote("Resumed from " + FormatTime(target) + "   ·   LB to go back 10 s");
+            return target;
         }
 
         // Same as a manual skip: once playing, jump forward, stay a second, and jump back.
@@ -835,14 +1768,14 @@ namespace StremioXbox
             return seconds == 0 ? "off" : seconds > 0 ? "+" + seconds + " s after play" : "+" + (-seconds) + " s before play";
         }
 
-        private async Task<bool> SeekAndWaitAsync(MediaPlaybackSession session, TimeSpan target)
+        private async Task<bool> SeekAndWaitAsync(MediaPlaybackSession session, TimeSpan target, bool stopOldDownloads = false)
         {
             var done = new TaskCompletionSource<bool>();
             Windows.Foundation.TypedEventHandler<MediaPlaybackSession, object> handler = (s, e) => done.TrySetResult(true);
             session.SeekCompleted += handler;
             try
             {
-                _cache?.SeekStarted();
+                _cache?.SeekStarted(stopOldDownloads);
                 session.Position = target;
                 return await Task.WhenAny(done.Task, Task.Delay(10000)) == done.Task;
             }
@@ -865,15 +1798,12 @@ namespace StremioXbox
             var bytesPerSecond = cache.Size / duration;
             var target = (long)Math.Min(cache.AheadBytes / 2, bytesPerSecond * 15);
             var watch = Stopwatch.StartNew();
-            _osdMessage = "Buffering...";
-            ShowOsd();
             while (cache.BufferedAheadBytes < target && watch.Elapsed < TimeSpan.FromSeconds(15) && player == _mediaPlayer)
             {
                 await Task.Delay(250);
             }
 
             var buffered = cache.BufferedAheadBytes;
-            _osdMessage = null;
             Log("info", string.Format("Prebuffered {0} MB ({1:0.0} s of video) in {2} ms", buffered >> 20, buffered / bytesPerSecond, watch.ElapsedMilliseconds));
         }
 
@@ -888,19 +1818,29 @@ namespace StremioXbox
 
                 var video = DescribeMedia(sender, out var width, out var height, out var frameRate, out var transferFunction, out var subtype);
                 Log("info", video);
+                var reopened = _reopening; // Audio switch: same video, the display is already in the right mode.
 
-                // Decided from what the decoder reports, not from release names: Dolby Vision only when
-                // the Xbox decodes it as DV (subtype DVHE/DVH1); DV MKVs decode as HEVC + HDR10 base layer.
-                var range = IsDolbyVisionSubtype(subtype) ? VideoRange.DolbyVision : RangeFromTransferFunction(transferFunction);
-                var fromName = false;
-                if (range == VideoRange.Sdr && transferFunction == null && NameSaysHdr(_current))
+                if (!reopened)
                 {
-                    range = VideoRange.Hdr10;
-                    fromName = true;
-                }
+                    // Decided from what the decoder reports, not from release names: Dolby Vision only when
+                    // the Xbox decodes it as DV (subtype DVHE/DVH1); DV MKVs decode as HEVC + HDR10 base layer.
+                    var range = IsDolbyVisionSubtype(subtype) ? VideoRange.DolbyVision : RangeFromTransferFunction(transferFunction);
+                    var fromName = false;
+                    if (range == VideoRange.Sdr && transferFunction == null && NameSaysHdr(_current))
+                    {
+                        range = VideoRange.Hdr10;
+                        fromName = true;
+                    }
 
-                Log("info", "Video range: " + range + " (decoder subtype " + subtype + ", transfer function " + (transferFunction?.ToString() ?? "unknown") + (fromName ? ", HDR from release name" : string.Empty) + ")");
-                Log("info", await _displayModes.SwitchAsync(width, height, frameRate, range));
+                    Log("info", "Video range: " + range + " (decoder subtype " + subtype + ", transfer function " + (transferFunction?.ToString() ?? "unknown") + (fromName ? ", HDR from release name" : string.Empty) + ")");
+                    Log("info", await _displayModes.SwitchAsync(width, height, frameRate, range));
+                    if (range == VideoRange.Hdr10 && NameSaysDolbyVision(_current))
+                    {
+                        // Profile 7/8: the Xbox decodes Dolby Vision only for profile 5; the HDR10 base layer plays.
+                        Log("info", "Dolby Vision in the name but decoded as HDR10 (profile 7/8 base layer)");
+                        AddOsdNote("Dolby Vision profile 7/8 plays as HDR10 on Xbox");
+                    }
+                }
 
                 if (!_displayRequestActive)
                 {
@@ -908,10 +1848,16 @@ namespace StremioXbox
                     _displayRequestActive = true;
                 }
 
-                var restartSeek = RestartSeekModes[_restartSeekMode];
+                var origin = await ResumeAsync(sender);
+                if (sender != _mediaPlayer)
+                {
+                    return;
+                }
+
+                var restartSeek = reopened ? 0 : RestartSeekModes[_restartSeekMode];
                 if (restartSeek < 0)
                 {
-                    await RestartSeekBeforePlayAsync(sender, -restartSeek);
+                    await RestartSeekBeforePlayAsync(sender, -restartSeek, origin);
                 }
 
                 await PrebufferAsync(sender);
@@ -920,13 +1866,47 @@ namespace StremioXbox
                     return;
                 }
 
-                sender.Play();
-                StartDiagnostics();
-                ShowOsd();
+                if (!(reopened && _reopenWasPaused))
+                {
+                    sender.Play();
+                }
+
+                // The restart seek (see RestartSeekAfterPlayAsync) jumps ahead and back once playback runs. Done
+                // in view it looked like the video skipping, so it runs muted, behind the loading screen.
                 if (restartSeek > 0)
                 {
-                    await RestartSeekAfterPlayAsync(sender, restartSeek);
+                    var wasMuted = sender.IsMuted;
+                    sender.IsMuted = true;
+                    Player.Opacity = 0;
+                    LoadingText.Text = "Almost ready";
+                    try
+                    {
+                        await RestartSeekAfterPlayAsync(sender, restartSeek);
+                    }
+                    finally
+                    {
+                        if (sender == _mediaPlayer)
+                        {
+                            sender.IsMuted = wasMuted;
+                            Player.Opacity = 1;
+                        }
+                    }
+
+                    if (sender != _mediaPlayer)
+                    {
+                        return;
+                    }
                 }
+
+                _starting = false;
+                _reopening = false;
+                _reopenFallback = -1;
+                _hasPlayed = true;
+                AddOsdNote(_audioNote);
+                _audioNote = null;
+                UpdateLoading();
+                StartDiagnostics();
+                ShowOsd();
             });
         }
 
@@ -940,10 +1920,28 @@ namespace StremioXbox
                 }
 
                 var code = args.ExtendedErrorCode == null ? string.Empty : string.Format(" (0x{0:X8})", args.ExtendedErrorCode.HResult);
+                if (_reopening && _reopenFallback >= 0)
+                {
+                    var fallback = _reopenFallback;
+                    _reopenFallback = -1;
+                    Log("warn", "Audio switch: the new track failed to open (" + args.Error + code + "); going back to track " + (fallback + 1));
+                    _osdMessage = "That audio track didn't play; back to the previous one";
+                    ReopenWithAudio(fallback, -1, "the previous track");
+                    return;
+                }
+
                 LogPlaybackStatus("at failure");
                 Log("error", "Native player failed: " + args.Error + code + " " + args.ErrorMessage);
-                StopPlayback(resetDisplay: true);
-                SetDebugVisible(true);
+                var reason = args.Error == MediaPlayerError.NetworkError ? "the server stopped responding"
+                    : args.Error == MediaPlayerError.SourceNotSupported ? "the Xbox can't play this format"
+                    : args.Error == MediaPlayerError.DecodingError ? "the video couldn't be decoded"
+                    : "playback failed" + code;
+                if (_hasPlayed)
+                {
+                    PostPlayerEvent("progress", true); // Keep the position for a retry with another stream.
+                }
+
+                FailPlayback("Couldn't play this stream: " + reason + ". Pick another stream to keep watching.");
             });
         }
 
@@ -951,7 +1949,22 @@ namespace StremioXbox
         {
             _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
             {
-                if (sender == _mediaPlayer)
+                if (sender != _mediaPlayer)
+                {
+                    return;
+                }
+
+                Log("info", "Playback ended" + (_nextLabel != null ? "; next: " + _nextLabel + (_binge ? " (binge watching)" : string.Empty) : string.Empty));
+                PostPlayerEvent("ended", true);
+                var session = _current?.Session ?? 0;
+                if (_nextLabel != null && _binge)
+                {
+                    // The page opens the next episode's stream (or its stream list, then says 'playerIdle').
+                    var label = _nextLabel;
+                    StopPlayback(resetDisplay: false);
+                    ShowPreparing(session, label, "Up next");
+                }
+                else
                 {
                     StopPlayback(resetDisplay: true);
                 }
@@ -967,9 +1980,26 @@ namespace StremioXbox
                 _mediaPlayer.MediaEnded -= OnMediaEnded;
                 _mediaPlayer.PlaybackSession.BufferingStarted -= OnBufferingStarted;
                 _mediaPlayer.PlaybackSession.BufferingEnded -= OnBufferingEnded;
+                _mediaPlayer.PlaybackSession.PlaybackStateChanged -= OnPlaybackStateChanged;
                 Player.SetMediaPlayer(null);
                 _mediaPlayer.Dispose();
                 _mediaPlayer = null;
+            }
+
+            _starting = false;
+            _reopening = false;
+            _hasPlayed = false;
+            _scrubTarget = null;
+            _scrubTimer?.Stop();
+            _osdMessage = null;
+            CloseMenu();
+            UpNext.Visibility = Visibility.Collapsed;
+            SkipIntro.Visibility = Visibility.Collapsed;
+            if (!_preparing)
+            {
+                _progressTimer?.Stop();
+                LoadingPanel.Visibility = Visibility.Collapsed;
+                Player.PosterSource = null;
             }
 
             if (_cache != null)
@@ -1000,6 +2030,11 @@ namespace StremioXbox
             {
                 _ = _displayModes.ResetAsync();
                 _webView?.Focus(FocusState.Programmatic);
+                ApplyCursorMode();
+                if (_pendingRecovery.HasValue)
+                {
+                    _ = RecoverPageAsync(_pendingRecovery.Value);
+                }
             }
         }
 
@@ -1223,18 +2258,54 @@ namespace StremioXbox
                 return true; // B closes the keyboard; do not also go back.
             }
 
+            if (DebugPanel.Visibility == Visibility.Visible)
+            {
+                SetDebugVisible(false);
+                return true;
+            }
+
             if (PlayerLayer.Visibility == Visibility.Visible)
             {
+                if (TrackMenu.Visibility == Visibility.Visible)
+                {
+                    CloseMenu();
+                    return true;
+                }
+
+                if (SkipIntro.Visibility == Visibility.Visible)
+                {
+                    _skipIntroDismissed = true;
+                    SkipIntro.Visibility = Visibility.Collapsed;
+                    return true;
+                }
+
+                if (UpNext.Visibility == Visibility.Visible)
+                {
+                    _upNextDismissed = true;
+                    UpNext.Visibility = Visibility.Collapsed;
+                    return true;
+                }
+
+                if (_preparing && _mediaPlayer == null)
+                {
+                    Log("info", "Loading cancelled by user");
+                    PostPlayerEvent("cancel", false);
+                    _cancelledSession = _preparingSession;
+                    _preparing = false;
+                    StopPlayback(resetDisplay: true);
+                    return true;
+                }
+
                 LogPlaybackStatus("stopped by user");
+                PostPlayerEvent("stopped", true); // Stremio saves the position (Continue Watching).
                 StopPlayback(resetDisplay: true);
                 Log("info", "Playback stopped by user");
                 return true;
             }
 
-            if (DebugPanel.Visibility == Visibility.Visible)
+            if (_statusRetry)
             {
-                SetDebugVisible(false);
-                return true;
+                return true; // Nothing behind the connection screen to go back to.
             }
 
             // Off the home screen, go back in Stremio's own history (WebView2's GoBack ignores pushState
@@ -1251,7 +2322,77 @@ namespace StremioXbox
         // Keyboard shortcuts for testing on a PC. Controller input comes from GamepadInput.
         private void OnAcceleratorKeyActivated(CoreDispatcher sender, AcceleratorKeyEventArgs args)
         {
-            if (args.EventType != CoreAcceleratorKeyEventType.KeyDown || args.KeyStatus.WasKeyDown)
+            if (args.EventType != CoreAcceleratorKeyEventType.KeyDown)
+            {
+                return;
+            }
+
+            // PC keyboard for the app's own screens (player, error screen, debug log). The Stremio pages
+            // themselves are driven from shell.js, which gets the keys while the page has focus.
+            if (!IsXbox && !_keyboardVisible &&
+                (PlayerLayer.Visibility == Visibility.Visible || StatusLayer.Visibility == Visibility.Visible || DebugPanel.Visibility == Visibility.Visible))
+            {
+                var repeat = args.KeyStatus.WasKeyDown;
+                PadButton? key = null;
+                switch (args.VirtualKey)
+                {
+                    case VirtualKey.Up:
+                        key = PadButton.Up;
+                        break;
+                    case VirtualKey.Down:
+                        key = PadButton.Down;
+                        break;
+                    case VirtualKey.Left:
+                        key = PadButton.Left;
+                        break;
+                    case VirtualKey.Right:
+                        key = PadButton.Right;
+                        break;
+                    case VirtualKey.Enter:
+                    case VirtualKey.Space:
+                        key = repeat ? (PadButton?)null : PadButton.A;
+                        break;
+                    case VirtualKey.PageUp:
+                        key = repeat ? (PadButton?)null : PadButton.LeftShoulder;
+                        break;
+                    case VirtualKey.PageDown:
+                        key = repeat ? (PadButton?)null : PadButton.RightShoulder;
+                        break;
+                    case VirtualKey.Home:
+                        key = PadButton.LeftTrigger;
+                        break;
+                    case VirtualKey.End:
+                        key = PadButton.RightTrigger;
+                        break;
+                    case VirtualKey.Y:
+                        key = repeat ? (PadButton?)null : PadButton.Y;
+                        break;
+                    case VirtualKey.X:
+                        key = repeat ? (PadButton?)null : PadButton.X;
+                        break;
+                    case VirtualKey.M:
+                        key = repeat ? (PadButton?)null : PadButton.Menu;
+                        break;
+                    case VirtualKey.Escape:
+                    case VirtualKey.Back:
+                        if (!repeat)
+                        {
+                            HandleBack();
+                        }
+
+                        args.Handled = true;
+                        return;
+                }
+
+                if (key.HasValue)
+                {
+                    OnPadButton(key.Value);
+                    args.Handled = true;
+                    return;
+                }
+            }
+
+            if (args.KeyStatus.WasKeyDown)
             {
                 return;
             }
@@ -1270,7 +2411,33 @@ namespace StremioXbox
                     OnPadButton(PadButton.X);
                     args.Handled = true;
                     break;
+                case VirtualKey.F4:
+                    if (!IsXbox && PlayerLayer.Visibility != Visibility.Visible)
+                    {
+                        PlayTestStream();
+                        args.Handled = true;
+                    }
+
+                    break;
             }
+        }
+
+        // PC only (F4): play a public sample video in the native player, with a pretend intro at 0:05-0:40, to
+        // try the player's controls without a Stremio streaming server or an addon that returns HTTP streams.
+        private void PlayTestStream()
+        {
+            var message = new JsonObject
+            {
+                ["url"] = JsonValue.CreateStringValue("https://archive.org/download/BigBuckBunny_328/BigBuckBunny_512kb.mp4"),
+                ["name"] = JsonValue.CreateStringValue("Test stream"),
+                ["title"] = JsonValue.CreateStringValue("Big Buck Bunny"),
+                ["subtitle"] = JsonValue.CreateStringValue("Player test (F4) · pretend intro 0:05 to 0:40"),
+                ["introFrom"] = JsonValue.CreateNumberValue(5000),
+                ["introTo"] = JsonValue.CreateNumberValue(40000),
+                ["binge"] = JsonValue.CreateBooleanValue(false),
+            };
+            Log("info", "Playing the test stream (F4)");
+            StartNativePlayback(PlayRequest.FromJson(message));
         }
 
         private void OnPadButton(PadButton button)
@@ -1283,6 +2450,16 @@ namespace StremioXbox
             if (button == PadButton.View)
             {
                 SetDebugVisible(DebugPanel.Visibility != Visibility.Visible);
+                return;
+            }
+
+            if (_statusRetry && DebugPanel.Visibility != Visibility.Visible)
+            {
+                if (button == PadButton.A)
+                {
+                    RetryPage("A pressed");
+                }
+
                 return;
             }
 
@@ -1382,6 +2559,9 @@ namespace StremioXbox
                 case PadButton.A:
                     SendNavigation("activate");
                     break;
+                case PadButton.Menu:
+                    SendNavigation("menu"); // Options for the highlighted title (library, watched, Continue Watching).
+                    break;
             }
         }
 
@@ -1405,68 +2585,587 @@ namespace StremioXbox
         private void HandlePlayerButton(PadButton button)
         {
             var session = _mediaPlayer?.PlaybackSession;
-            if (session == null)
+            if (session == null || _starting)
             {
+                return; // Loading screen: only B (cancel) does anything.
+            }
+
+            if (TrackMenu.Visibility == Visibility.Visible)
+            {
+                HandleMenuButton(button);
                 return;
             }
 
+            // Console streaming-app layout: A play/pause (or the card on screen), D-pad seeks in 10 s steps,
+            // triggers rewind / fast-forward while held, bumpers jump 10 s at once, Y / X audio & subtitles.
             switch (button)
             {
                 case PadButton.Y:
-                    CycleAudioTrack();
+                    OpenTracksPanel(AudioColumn);
                     break;
                 case PadButton.X:
-                    CycleSubtitles();
+                    OpenTracksPanel(SubtitleColumn);
                     break;
                 case PadButton.A:
-                case PadButton.Menu:
-                    if (session.PlaybackState == MediaPlaybackState.Playing)
+                    if (SkipIntro.Visibility == Visibility.Visible)
                     {
-                        _mediaPlayer.Pause();
-                    }
-                    else
-                    {
-                        _mediaPlayer.Play();
+                        SkipIntroNow();
+                        break;
                     }
 
+                    if (UpNext.Visibility == Visibility.Visible)
+                    {
+                        PlayNext();
+                        return;
+                    }
+
+                    TogglePause(session);
+                    break;
+                case PadButton.Menu:
+                    TogglePause(session);
                     break;
                 case PadButton.Left:
-                    Seek(session, -10);
+                    Scrub(session, -10, accelerate: true);
                     break;
                 case PadButton.Right:
-                    Seek(session, 10);
+                    Scrub(session, 10, accelerate: true);
+                    break;
+                case PadButton.LeftTrigger:
+                    Scrub(session, -30, accelerate: true);
+                    break;
+                case PadButton.RightTrigger:
+                    Scrub(session, 30, accelerate: true);
                     break;
                 case PadButton.LeftShoulder:
-                    Seek(session, -60);
+                    Jump(session, -10);
                     break;
                 case PadButton.RightShoulder:
-                    Seek(session, 60);
+                    Jump(session, 10);
                     break;
             }
 
-            ShowOsd();
+            if (TrackMenu.Visibility != Visibility.Visible)
+            {
+                ShowOsd();
+            }
         }
 
-        private void Seek(MediaPlaybackSession session, double seconds)
+        private void TogglePause(MediaPlaybackSession session)
         {
-            if (!session.CanSeek)
+            if (_scrubTarget.HasValue)
             {
+                CommitScrub();
+                _mediaPlayer.Play(); // A after seeking: play from there.
                 return;
             }
 
-            var target = session.Position + TimeSpan.FromSeconds(seconds);
+            if (session.PlaybackState == MediaPlaybackState.Playing)
+            {
+                _mediaPlayer.Pause();
+            }
+            else
+            {
+                _mediaPlayer.Play();
+            }
+        }
+
+        // LB / RB: jump 10 s right away (one press, one seek).
+        private void Jump(MediaPlaybackSession session, double seconds)
+        {
+            Scrub(session, seconds, accelerate: false);
+            if (_scrubTarget.HasValue)
+            {
+                CommitScrub();
+            }
+        }
+
+        // D-pad / trigger seeking adds up to a target shown on the bar and applied 0.7 s after the last
+        // press: one seek instead of one per press, which on large files each meant a new download position.
+        // Holding speeds up (x3 after 8 repeats, x6 after 24): the D-pad from 10 s steps, triggers from 30 s.
+        private void Scrub(MediaPlaybackSession session, double seconds, bool accelerate)
+        {
+            if (!session.CanSeek)
+            {
+                _osdMessage = "This stream can't seek";
+                return;
+            }
+
+            var now = Environment.TickCount;
+            if (accelerate)
+            {
+                _scrubRepeats = unchecked(now - _lastScrubTick) < 250 ? _scrubRepeats + 1 : 0;
+                _lastScrubTick = now;
+                seconds *= _scrubRepeats >= 24 ? 6 : _scrubRepeats >= 8 ? 3 : 1;
+            }
+
+            var target = (_scrubTarget ?? session.Position) + TimeSpan.FromSeconds(seconds);
             if (target < TimeSpan.Zero)
             {
                 target = TimeSpan.Zero;
             }
 
-            if (session.NaturalDuration > TimeSpan.Zero && target > session.NaturalDuration)
+            var duration = session.NaturalDuration;
+            if (duration > TimeSpan.Zero && target > duration - TimeSpan.FromSeconds(1))
             {
-                target = session.NaturalDuration - TimeSpan.FromSeconds(1);
+                target = duration - TimeSpan.FromSeconds(1);
             }
 
-            _cache?.SeekStarted();
-            session.Position = target;
+            _scrubTarget = target;
+            if (_scrubTimer == null)
+            {
+                _scrubTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(700) };
+                _scrubTimer.Tick += (sender, e) => CommitScrub();
+            }
+
+            _scrubTimer.Stop();
+            _scrubTimer.Start();
+            UpNext.Visibility = Visibility.Collapsed;
+            SkipIntro.Visibility = Visibility.Collapsed;
+            ShowOsd();
+        }
+
+        private void CommitScrub()
+        {
+            _scrubTimer?.Stop();
+            var target = _scrubTarget;
+            _scrubTarget = null;
+            var session = _mediaPlayer?.PlaybackSession;
+            if (!target.HasValue || session == null)
+            {
+                return;
+            }
+
+            _cache?.SeekStarted(true);
+            session.Position = target.Value;
+            _lastProgressTick = 0; // Report the new position on the next tick.
+            Log("info", "Seek to " + FormatTime(target.Value));
+            if (Osd.Visibility == Visibility.Visible)
+            {
+                ShowOsd();
+            }
+        }
+
+        private static string FormatTime(TimeSpan time)
+        {
+            return time.TotalHours >= 1 ? time.ToString(@"h\:mm\:ss") : time.ToString(@"m\:ss");
+        }
+
+        // ---- Audio & Subtitles panel ------------------------------------------------------------------
+        // One panel with two columns, like the console streaming apps: audio on the left, subtitles on the
+        // right. Y opens it on audio, X on subtitles; ◀ ▶ switch columns, ▲ ▼ move, A picks, B closes.
+        private sealed class MenuEntry
+        {
+            public MenuEntry(string label, bool selected, Action choose)
+            {
+                Label = label;
+                Selected = selected;
+                Choose = choose;
+            }
+
+            public string Label { get; }
+
+            public bool Selected { get; }
+
+            public Action Choose { get; }
+        }
+
+        private const int MenuWindow = 8;
+        private const int AudioColumn = 0;
+        private const int SubtitleColumn = 1;
+
+        private void OpenTracksPanel(int column)
+        {
+            if (!(_mediaPlayer?.Source is MediaPlaybackItem item))
+            {
+                return;
+            }
+
+            _menuColumns[AudioColumn] = AudioEntries(item);
+            _menuColumns[SubtitleColumn] = SubtitleEntries(item);
+            for (var i = 0; i < _menuColumns.Length; i++)
+            {
+                _menuIndexes[i] = Math.Max(0, _menuColumns[i].FindIndex(entry => entry.Selected));
+            }
+
+            _menuColumn = _menuColumns[column].Count > 0 ? column : SubtitleColumn;
+            TrackMenu.Visibility = Visibility.Visible;
+            UpNext.Visibility = Visibility.Collapsed;
+            SkipIntro.Visibility = Visibility.Collapsed;
+            Osd.Visibility = Visibility.Collapsed;
+            RenderMenu();
+        }
+
+        private void CloseMenu()
+        {
+            TrackMenu.Visibility = Visibility.Collapsed;
+            _menuColumns[AudioColumn] = null;
+            _menuColumns[SubtitleColumn] = null;
+        }
+
+        private void RenderMenu()
+        {
+            RenderColumn(AudioColumn, AudioItems, AudioHeader, AudioPosition, "No audio tracks reported");
+            RenderColumn(SubtitleColumn, SubtitleItems, SubtitleHeader, SubtitlePosition, string.Empty);
+        }
+
+        private void RenderColumn(int column, StackPanel items, TextBlock header, TextBlock position, string emptyText)
+        {
+            var white = new SolidColorBrush(Windows.UI.Colors.White);
+            var dim = new SolidColorBrush(Windows.UI.Color.FromArgb(0x8C, 0xFF, 0xFF, 0xFF));
+            var soft = new SolidColorBrush(Windows.UI.Color.FromArgb(0xC0, 0xFF, 0xFF, 0xFF));
+            var active = column == _menuColumn;
+            var entries = _menuColumns[column];
+            items.Children.Clear();
+            header.Foreground = active ? white : dim;
+            position.Text = string.Empty;
+            if (entries == null)
+            {
+                return;
+            }
+
+            if (entries.Count == 0)
+            {
+                items.Children.Add(new TextBlock { Text = emptyText, FontSize = 20, Foreground = dim, Margin = new Thickness(16, 10, 16, 10) });
+                return;
+            }
+
+            var index = _menuIndexes[column];
+            var start = Math.Max(0, Math.Min(index - (MenuWindow / 2), entries.Count - MenuWindow));
+            var end = Math.Min(entries.Count, start + MenuWindow);
+            for (var i = start; i < end; i++)
+            {
+                var entry = entries[i];
+                var here = i == index;
+                items.Children.Add(new Border
+                {
+                    Padding = new Thickness(14, 9, 14, 9),
+                    Margin = new Thickness(0, 0, 0, 2),
+                    CornerRadius = new CornerRadius(6),
+                    BorderThickness = new Thickness(0, 0, 0, 0),
+                    // The active column's row gets a soft white highlight and a purple edge; the other column
+                    // only keeps its row brighter.
+                    Background = new SolidColorBrush(here && active ? Windows.UI.Color.FromArgb(0x33, 0xFF, 0xFF, 0xFF) : Windows.UI.Color.FromArgb(0, 0, 0, 0)),
+                    Child = new Grid
+                    {
+                        Children =
+                        {
+                            new Border
+                            {
+                                Width = 4,
+                                CornerRadius = new CornerRadius(2),
+                                Margin = new Thickness(-10, 2, 0, 2),
+                                HorizontalAlignment = HorizontalAlignment.Left,
+                                Background = new SolidColorBrush(here && active ? Windows.UI.Color.FromArgb(255, 0x7B, 0x5B, 0xF5) : Windows.UI.Color.FromArgb(0, 0, 0, 0)),
+                            },
+                            new TextBlock
+                            {
+                                Text = (entry.Selected ? "✓   " : "      ") + entry.Label,
+                                FontSize = 22,
+                                FontWeight = here && active ? Windows.UI.Text.FontWeights.SemiBold : Windows.UI.Text.FontWeights.Normal,
+                                Foreground = here && active ? white : entry.Selected || (active && here) ? white : active ? soft : dim,
+                                TextTrimming = TextTrimming.CharacterEllipsis,
+                            },
+                        },
+                    },
+                });
+            }
+
+            position.Text = entries.Count > MenuWindow ? (index + 1) + " / " + entries.Count : string.Empty;
+        }
+
+        private void HandleMenuButton(PadButton button)
+        {
+            switch (button)
+            {
+                case PadButton.Left:
+                    SwitchMenuColumn(AudioColumn);
+                    break;
+                case PadButton.Right:
+                    SwitchMenuColumn(SubtitleColumn);
+                    break;
+                case PadButton.Up:
+                    MoveMenu(-1);
+                    break;
+                case PadButton.Down:
+                    MoveMenu(1);
+                    break;
+                case PadButton.LeftShoulder:
+                case PadButton.LeftTrigger:
+                    MoveMenu(-MenuWindow);
+                    break;
+                case PadButton.RightShoulder:
+                case PadButton.RightTrigger:
+                    MoveMenu(MenuWindow);
+                    break;
+                case PadButton.A:
+                    var entries = _menuColumns[_menuColumn];
+                    if (entries == null || entries.Count == 0)
+                    {
+                        break;
+                    }
+
+                    var entry = entries[_menuIndexes[_menuColumn]];
+                    CloseMenu();
+                    entry.Choose();
+                    ShowOsd();
+                    break;
+                case PadButton.Y:
+                    if (_menuColumn == AudioColumn)
+                    {
+                        CloseMenu();
+                    }
+                    else
+                    {
+                        SwitchMenuColumn(AudioColumn);
+                    }
+
+                    break;
+                case PadButton.X:
+                    if (_menuColumn == SubtitleColumn)
+                    {
+                        CloseMenu();
+                    }
+                    else
+                    {
+                        SwitchMenuColumn(SubtitleColumn);
+                    }
+
+                    break;
+                case PadButton.Menu:
+                    CloseMenu();
+                    break;
+            }
+        }
+
+        private void SwitchMenuColumn(int column)
+        {
+            if (_menuColumns[column] != null && _menuColumns[column].Count > 0 && column != _menuColumn)
+            {
+                _menuColumn = column;
+                RenderMenu();
+            }
+        }
+
+        private void MoveMenu(int delta)
+        {
+            var entries = _menuColumns[_menuColumn];
+            if (entries == null || entries.Count == 0)
+            {
+                return;
+            }
+
+            _menuIndexes[_menuColumn] = Math.Max(0, Math.Min(entries.Count - 1, _menuIndexes[_menuColumn] + delta));
+            RenderMenu();
+        }
+
+        private List<MenuEntry> AudioEntries(MediaPlaybackItem item)
+        {
+            var entries = new List<MenuEntry>();
+            try
+            {
+                var tracks = item.AudioTracks;
+                for (var i = 0; i < tracks.Count; i++)
+                {
+                    var index = i;
+                    var label = DescribeAudio(tracks[i]);
+                    entries.Add(new MenuEntry(label, i == tracks.SelectedIndex, () => SwitchAudioTrack(item, index, label)));
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("warn", "Audio tracks unavailable: " + ex.Message);
+            }
+
+            return entries;
+        }
+
+        private List<MenuEntry> SubtitleEntries(MediaPlaybackItem item)
+        {
+            var entries = new List<MenuEntry>();
+            try
+            {
+                var tracks = item.TimedMetadataTracks;
+                var indices = Enumerable.Range(0, tracks.Count).Where(i => IsSubtitleTrack(tracks[i])).ToList();
+                var shown = indices.Where(i => tracks.GetPresentationMode((uint)i) != TimedMetadataTrackPresentationMode.Disabled).ToList();
+                entries.Add(new MenuEntry("Off", shown.Count == 0, () => SelectSubtitle(item, -1, true)));
+                entries.AddRange(indices.Select(index => new MenuEntry(DescribeSubtitle(tracks[index]), shown.Contains(index), () => SelectSubtitle(item, index, true))));
+            }
+            catch (Exception ex)
+            {
+                Log("warn", "Subtitle tracks unavailable: " + ex.Message);
+                if (entries.Count == 0)
+                {
+                    entries.Add(new MenuEntry("Off", true, () => { }));
+                }
+            }
+
+            return entries;
+        }
+
+        // index -1 turns subtitles off.
+        private void SelectSubtitle(MediaPlaybackItem item, int index, bool byUser)
+        {
+            try
+            {
+                var tracks = item.TimedMetadataTracks;
+                for (var i = 0; i < tracks.Count; i++)
+                {
+                    if (i != index && IsSubtitleTrack(tracks[i]))
+                    {
+                        tracks.SetPresentationMode((uint)i, TimedMetadataTrackPresentationMode.Disabled);
+                    }
+                }
+
+                if (index >= 0)
+                {
+                    tracks.SetPresentationMode((uint)index, TimedMetadataTrackPresentationMode.PlatformPresented);
+                }
+
+                if (byUser)
+                {
+                    _subtitleUserChoice = true;
+                    _osdMessage = index >= 0 ? "Subtitles: " + DescribeSubtitle(tracks[index]) : "Subtitles: off";
+                }
+
+                Log("info", (byUser ? "Subtitles: " : "Subtitles (Stremio's language setting): ") + (index >= 0 ? DescribeSubtitle(tracks[index]) : "off"));
+            }
+            catch (Exception ex)
+            {
+                _osdMessage = "Subtitle switch failed";
+                Log("warn", "Subtitle switch failed: " + ex.Message);
+            }
+        }
+
+        // Like Stremio: turn on subtitles in the language set in Stremio's settings, once, unless the viewer
+        // already chose. Embedded tracks resolve first; addon subtitles follow as their files download.
+        private void AutoSelectSubtitles(MediaPlaybackItem item)
+        {
+            if (_restoreSubtitle != null && _mediaPlayer?.Source == item)
+            {
+                // After an audio switch: the subtitle that was on (external ones resolve one by one).
+                if (_restoreSubtitle.Length == 0)
+                {
+                    _restoreSubtitle = null;
+                    return;
+                }
+
+                var all = item.TimedMetadataTracks;
+                for (var i = 0; i < all.Count; i++)
+                {
+                    if (IsSubtitleTrack(all[i]) && DescribeSubtitle(all[i]) == _restoreSubtitle)
+                    {
+                        _restoreSubtitle = null;
+                        SelectSubtitle(item, i, false);
+                        return;
+                    }
+                }
+
+                return;
+            }
+
+            if (_subtitleAutoDone || _subtitleUserChoice || _current == null || _mediaPlayer?.Source != item)
+            {
+                return;
+            }
+
+            try
+            {
+                var tracks = item.TimedMetadataTracks;
+                for (var i = 0; i < tracks.Count; i++)
+                {
+                    if (IsSubtitleTrack(tracks[i]) && LanguageMatches(tracks[i].Language, _current.SubtitlesLanguage))
+                    {
+                        _subtitleAutoDone = true;
+                        SelectSubtitle(item, i, false);
+                        return;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("warn", "Subtitle auto-select failed: " + ex.Message);
+            }
+        }
+
+        // Stremio uses ISO 639-2 codes ("eng", "ger"); files and addons use 639-1 or 639-2 ("en", "deu").
+        private static readonly Dictionary<string, string> Iso6392To6391 = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["eng"] = "en", ["spa"] = "es", ["fre"] = "fr", ["fra"] = "fr", ["ger"] = "de", ["deu"] = "de", ["ita"] = "it",
+            ["por"] = "pt", ["pob"] = "pt", ["rus"] = "ru", ["jpn"] = "ja", ["kor"] = "ko", ["chi"] = "zh", ["zho"] = "zh",
+            ["ara"] = "ar", ["hin"] = "hi", ["tur"] = "tr", ["pol"] = "pl", ["dut"] = "nl", ["nld"] = "nl", ["swe"] = "sv",
+            ["nor"] = "no", ["nob"] = "no", ["dan"] = "da", ["fin"] = "fi", ["gre"] = "el", ["ell"] = "el", ["heb"] = "he",
+            ["hun"] = "hu", ["cze"] = "cs", ["ces"] = "cs", ["rum"] = "ro", ["ron"] = "ro", ["bul"] = "bg", ["ukr"] = "uk",
+            ["vie"] = "vi", ["tha"] = "th", ["ind"] = "id", ["may"] = "ms", ["msa"] = "ms", ["hrv"] = "hr", ["srp"] = "sr",
+            ["slv"] = "sl", ["slo"] = "sk", ["slk"] = "sk", ["per"] = "fa", ["fas"] = "fa", ["tam"] = "ta", ["tel"] = "te",
+            ["ben"] = "bn", ["mal"] = "ml", ["est"] = "et", ["lav"] = "lv", ["lit"] = "lt", ["ice"] = "is", ["isl"] = "is",
+        };
+
+        private static string NormalizeLanguage(string code)
+        {
+            var value = (code ?? string.Empty).Trim().ToLowerInvariant();
+            var dash = value.IndexOfAny(new[] { '-', '_' });
+            if (dash > 0)
+            {
+                value = value.Substring(0, dash);
+            }
+
+            return Iso6392To6391.TryGetValue(value, out var shortCode) ? shortCode : value;
+        }
+
+        private static bool LanguageMatches(string trackLanguage, string preferred)
+        {
+            var a = NormalizeLanguage(trackLanguage);
+            var b = NormalizeLanguage(preferred);
+            return a.Length > 0 && a != "und" && a == b;
+        }
+
+        private static string LanguageName(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code) || NormalizeLanguage(code) == "und")
+            {
+                return "Unknown";
+            }
+
+            try
+            {
+                var tag = NormalizeLanguage(code);
+                if (Windows.Globalization.Language.IsWellFormed(tag))
+                {
+                    var name = new Windows.Globalization.Language(tag).DisplayName;
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        return name;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+
+            return code;
+        }
+
+        private static string AudioFormatName(AudioTrack track)
+        {
+            var props = track.GetEncodingProperties();
+            var subtype = (props.Subtype ?? string.Empty).ToUpperInvariant();
+            return IsTrueHd(track) ? "Dolby TrueHD"
+                : subtype.Contains("EAC3") || subtype.Contains("E-AC3") || subtype.Contains("DDPLUS") ? "Dolby Digital Plus"
+                : subtype.Contains("AC3") ? "Dolby Digital"
+                : subtype.Contains("DTS") ? "DTS"
+                : subtype.Length > 0 ? props.Subtype
+                : "Audio";
+        }
+
+        private static string DescribeAudio(AudioTrack track)
+        {
+            var props = track.GetEncodingProperties();
+            var format = AudioFormatName(track);
+            var channels = props.ChannelCount == 8 ? "7.1" : props.ChannelCount == 6 ? "5.1" : props.ChannelCount == 2 ? "Stereo" : props.ChannelCount == 1 ? "Mono" : props.ChannelCount + " ch";
+            var label = string.IsNullOrEmpty(track.Label) ? string.Empty : "  ·  " + track.Label;
+            // An untagged track is just its format ("AAC Stereo"), not "Unknown · AAC Stereo".
+            var untagged = string.IsNullOrWhiteSpace(track.Language) || NormalizeLanguage(track.Language) == "und";
+            return (untagged ? string.Empty : LanguageName(track.Language) + "  ·  ") + format + " " + channels + label;
         }
 
         private void AddExternalSubtitles(MediaSource source, PlayRequest request)
@@ -1528,79 +3227,6 @@ namespace StremioXbox
             }
         }
 
-        private void CycleSubtitles()
-        {
-            if (!(_mediaPlayer?.Source is MediaPlaybackItem item))
-            {
-                return;
-            }
-
-            try
-            {
-                var tracks = item.TimedMetadataTracks;
-                var indices = Enumerable.Range(0, tracks.Count).Where(i => IsSubtitleTrack(tracks[i])).ToList();
-                if (indices.Count == 0)
-                {
-                    _osdMessage = "No subtitles";
-                    return;
-                }
-
-                _subtitleChoice = (_subtitleChoice + 1) % (indices.Count + 1);
-                foreach (var index in indices)
-                {
-                    tracks.SetPresentationMode((uint)index, TimedMetadataTrackPresentationMode.Disabled);
-                }
-
-                if (_subtitleChoice == 0)
-                {
-                    _osdMessage = "Subtitles: off";
-                }
-                else
-                {
-                    var index = indices[_subtitleChoice - 1];
-                    tracks.SetPresentationMode((uint)index, TimedMetadataTrackPresentationMode.PlatformPresented);
-                    _osdMessage = "Subtitles " + _subtitleChoice + "/" + indices.Count + ": " + DescribeSubtitle(tracks[index]);
-                }
-
-                Log("info", _osdMessage);
-            }
-            catch (Exception ex)
-            {
-                _osdMessage = "Subtitles unavailable";
-                Log("warn", "Subtitle switch failed: " + ex.Message);
-            }
-        }
-
-        private void CycleAudioTrack()
-        {
-            if (!(_mediaPlayer?.Source is MediaPlaybackItem item))
-            {
-                return;
-            }
-
-            try
-            {
-                var tracks = item.AudioTracks;
-                if (tracks.Count < 2)
-                {
-                    _osdMessage = "Only one audio track";
-                    return;
-                }
-
-                var next = (tracks.SelectedIndex + 1) % tracks.Count;
-                tracks.SelectedIndex = next;
-                var props = tracks[next].GetEncodingProperties();
-                var label = string.IsNullOrEmpty(tracks[next].Label) ? string.Empty : " " + tracks[next].Label;
-                _osdMessage = string.Format("Audio {0}/{1}: [{2}] {3} {4}ch{5}", next + 1, tracks.Count, tracks[next].Language, props.Subtype, props.ChannelCount, label);
-                Log("info", _osdMessage);
-            }
-            catch (Exception ex)
-            {
-                _osdMessage = "Audio switch failed";
-                Log("warn", "Audio switch failed: " + ex.Message);
-            }
-        }
-
         private void ShowOsd()
         {
             if (_osdTimer == null)
@@ -1618,15 +3244,17 @@ namespace StremioXbox
         private void UpdateOsd()
         {
             var session = _mediaPlayer?.PlaybackSession;
-            if (session == null)
+            if (session == null || TrackMenu.Visibility == Visibility.Visible)
             {
                 _osdTimer?.Stop();
                 Osd.Visibility = Visibility.Collapsed;
+                SetCenterIndicator(null);
                 return;
             }
 
-            var paused = session.PlaybackState != MediaPlaybackState.Playing;
-            if (!paused && DateTime.UtcNow >= _osdHideAt)
+            var state = session.PlaybackState;
+            var paused = state != MediaPlaybackState.Playing;
+            if (!paused && !_scrubTarget.HasValue && DateTime.UtcNow >= _osdHideAt)
             {
                 _osdTimer.Stop();
                 _osdMessage = null;
@@ -1635,15 +3263,99 @@ namespace StremioXbox
             }
 
             var duration = session.NaturalDuration;
-            OsdTitle.Text = _current?.ToString() ?? string.Empty;
+            var position = session.Position;
+            OsdTitle.Text = _current?.DisplayTitle ?? string.Empty;
+            OsdSubtitle.Text = _current?.DisplaySubtitle ?? string.Empty;
+            OsdSubtitle.Visibility = string.IsNullOrEmpty(OsdSubtitle.Text) ? Visibility.Collapsed : Visibility.Visible;
             OsdInfo.Text = _osdMessage ?? string.Empty;
             OsdInfo.Visibility = string.IsNullOrEmpty(_osdMessage) ? Visibility.Collapsed : Visibility.Visible;
-            OsdProgress.Value = duration.TotalSeconds > 0 ? session.Position.TotalSeconds / duration.TotalSeconds : 0;
-            OsdTime.Text = string.Format(
-                "{0}   {1:h\\:mm\\:ss} / {2:h\\:mm\\:ss}",
-                paused ? (session.PlaybackState == MediaPlaybackState.Buffering ? "Buffering" : "Paused") : "Playing",
-                session.Position,
-                duration);
+
+            var buffering = state == MediaPlaybackState.Buffering || state == MediaPlaybackState.Opening;
+            string status;
+            if (_scrubTarget.HasValue)
+            {
+                var delta = _scrubTarget.Value - position;
+                position = _scrubTarget.Value;
+                status = "Seek " + (delta < TimeSpan.Zero ? "−" : "+") + FormatTime(delta.Duration());
+            }
+            else
+            {
+                status = !paused ? "Playing" : buffering ? "Buffering" : "Paused";
+            }
+
+            // Seek bar: the played part and a knob that grows while seeking.
+            var fraction = duration.TotalSeconds > 0 ? Math.Max(0, Math.Min(1, position.TotalSeconds / duration.TotalSeconds)) : 0;
+            var width = OsdTrack.ActualWidth;
+            var knob = _scrubTarget.HasValue ? 26 : 16;
+            OsdFill.Width = width * fraction;
+            OsdKnob.Width = knob;
+            OsdKnob.Height = knob;
+            OsdKnobShift.X = (width * fraction) - (knob / 2.0);
+            OsdTime.Text = duration > TimeSpan.Zero
+                ? string.Format("{0}   ·   {1} / {2}", status, FormatTime(position), FormatTime(duration))
+                : status + "   ·   " + FormatTime(position);
+            OsdRemaining.Text = duration > TimeSpan.Zero ? "−" + FormatTime(duration - position < TimeSpan.Zero ? TimeSpan.Zero : duration - position) : string.Empty;
+            SetCenterIndicator(_scrubTarget.HasValue || LoadingPanel.Visibility == Visibility.Visible ? null : buffering ? "buffering" : paused ? "paused" : null);
+        }
+
+        // The round indicator in the middle of the picture: "paused", "buffering" or null (hidden).
+        private void SetCenterIndicator(string kind)
+        {
+            CenterIndicator.Visibility = kind == null ? Visibility.Collapsed : Visibility.Visible;
+            CenterGlyph.Visibility = kind == "paused" ? Visibility.Visible : Visibility.Collapsed;
+            CenterRing.Visibility = kind == "buffering" ? Visibility.Visible : Visibility.Collapsed;
+            CenterRing.IsActive = kind == "buffering";
+        }
+
+        // Skip intro / Up Next: in the bottom corner, lifted just above the bar while the bar is showing.
+        private void PositionCards()
+        {
+            var lift = Osd.Visibility == Visibility.Visible && Osd.ActualHeight > 0 ? -Math.Max(0, Osd.ActualHeight - 150) : 0;
+            Slide(SkipIntroShift, lift);
+            Slide(UpNextShift, lift);
+        }
+
+        private static void Slide(TranslateTransform shift, double to)
+        {
+            var animation = new DoubleAnimation
+            {
+                To = to,
+                Duration = TimeSpan.FromMilliseconds(260),
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+            };
+            Storyboard.SetTarget(animation, shift);
+            Storyboard.SetTargetProperty(animation, "Y");
+            var storyboard = new Storyboard();
+            storyboard.Children.Add(animation);
+            storyboard.Begin();
+        }
+
+        // Overlays fade in and out instead of popping (composition animations, run off the UI thread).
+        private void SetUpFades()
+        {
+            try
+            {
+                var compositor = ElementCompositionPreview.GetElementVisual(this).Compositor;
+                Windows.UI.Composition.ScalarKeyFrameAnimation Fade(float from, float to, int milliseconds)
+                {
+                    var animation = compositor.CreateScalarKeyFrameAnimation();
+                    animation.Target = "Opacity";
+                    animation.InsertKeyFrame(0f, from);
+                    animation.InsertKeyFrame(1f, to);
+                    animation.Duration = TimeSpan.FromMilliseconds(milliseconds);
+                    return animation;
+                }
+
+                foreach (var element in new UIElement[] { Osd, TrackMenu, SkipIntro, UpNext, CenterIndicator, Toast, LoadingPanel })
+                {
+                    ElementCompositionPreview.SetImplicitShowAnimation(element, Fade(0f, 1f, 220));
+                    ElementCompositionPreview.SetImplicitHideAnimation(element, Fade(1f, 0f, 180));
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("Fades unavailable: " + ex.Message);
+            }
         }
 
         private void SetDebugVisible(bool visible)

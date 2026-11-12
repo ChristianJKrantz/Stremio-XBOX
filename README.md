@@ -75,6 +75,34 @@ Full D-pad navigation, B to go back, a built-in cursor for the hard-to-reach bit
 
 </td>
 </tr>
+<tr>
+<td width="50%" valign="top">
+
+**⏯️ Continue Watching & resume**<br>
+The native player reports to Stremio like its own player: picks up where you left off, updates Continue Watching and watched marks, and syncs them to your Stremio account.
+
+</td>
+<td width="50%" valign="top">
+
+**⏭️ Next episode**<br>
+An Up Next card near the end of an episode. With Stremio's binge watching on, the next episode starts by itself on the same addon's stream.
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+**📺 Feels like an app**<br>
+Show and episode titles over the title's backdrop, a loading screen the moment you pick a stream, audio and subtitle menus, subtitles in your Stremio language, and the Xbox media remote. Browsing glides: the page eases along with the highlight and keeps the current row at the same height, and the highlighted poster grows slightly. The player fades its bar, Skip Intro / Up Next cards and Audio & Subtitles overlay in and out.
+
+</td>
+<td width="50%" valign="top">
+
+**🛟 Recovers by itself**<br>
+A friendly screen with retry when the Xbox is offline, an automatic reload if the page crashes, and a message (not a debug log) when a stream won't play.
+
+</td>
+</tr>
 </table>
 
 **Formats:** MKV, MP4 · HEVC, H.264 · E-AC3 (Atmos), AC3, AAC and more.
@@ -103,15 +131,25 @@ freezes the picture. Stremio-XBOX puts its own cache in between:
 
 ## ⚠️ Known limitations
 
-- **Dolby Vision Profile 7 / 8 play as HDR10.** The Xbox only outputs DV for Profile 5.
-- **Dolby TrueHD sometimes has no sound.** Pick an E-AC3 / AC3 track if that happens.
+- **Dolby Vision Profile 7 / 8 play as HDR10.** The Xbox's decoder only outputs DV for Profile 5, and
+  turning 7/8 into 5 would mean re-encoding the video, so an app can't change this. The player says so
+  on screen when a DV release plays as HDR10. Pick a Profile 5 (often WEB-DL) stream for real DV.
+- **Dolby TrueHD can be silent on Xbox.** When a file also has Dolby Digital Plus or Dolby Digital in
+  the same language, the player starts on that track instead (Y still offers TrueHD). When TrueHD is the
+  only track, it tells you, so you can pick another stream if there's no sound.
 - Built for direct / debrid links. Torrent streams need a streaming server.
 
 ## 🚧 Work in progress (WIP)
 
-- Switching audio **formats** mid-play (e.g. E-AC3 → AC3) can crash the player. Same-format switches are fine.
-- Seeking far past the buffered area can freeze for 5–20 s while the server catches up.
-- Native player progress is not synced to Stremio's Continue Watching yet.
+Fixes in this version that still need confirming on a console:
+
+- **Switching audio formats** (e.g. E-AC3 → AC3) used to crash the player. Now a switch to another
+  format reloads the video from the RAM buffer with the new track and returns to the same spot (a short
+  loading screen), and goes back to the old track if the new one fails. Same-format switches stay instant.
+- **Seeking far past the buffer** used to freeze for 5–20 s. Now the picture resumes as soon as its own
+  bytes arrive instead of a whole 4 MB chunk, and downloads for the old position stop so every connection
+  starts on the new one. In a simulated debrid server (5 MB/s per connection, 3 s first byte) the first
+  data after a far seek came 0.8 s sooner. What's left is mostly the server starting the new range.
 
 ## 🎮 Controls
 
@@ -126,6 +164,7 @@ freezes the picture. Stremio-XBOX puts its own cache in between:
 | D-pad / Left stick | Move |
 | A | Select |
 | B | Back |
+| Menu (☰) on a poster | Options: play / resume, details, add to or remove from Library, mark as watched, remove from Continue Watching |
 | Left stick click | Cursor mode |
 | View | Debug log |
 
@@ -139,11 +178,18 @@ freezes the picture. Stremio-XBOX puts its own cache in between:
 | Button | Action |
 | --- | --- |
 | A / Menu | Play / Pause |
-| ◀ / ▶ | −10 s / +10 s |
-| LB / RB | −60 s / +60 s |
-| Y | Audio track |
-| X | Subtitles |
-| B | Stop |
+| ◀ / ▶ | −10 s / +10 s (hold to go faster) |
+| LT / RT | Rewind / fast-forward (hold to go faster) |
+| LB / RB | Jump −10 s / +10 s |
+| Y / X | Audio & Subtitles (opens on audio / on subtitles) |
+| ▲ / ▼ | Show the progress bar |
+| A on Skip intro | Skip the intro |
+| A on Up Next | Play the next episode |
+| B | Close panel / hide card / stop |
+
+<sub>Same layout as the big console streaming apps. D-pad and trigger presses add up and apply once you stop, so one jump instead of many downloads. In the Audio & Subtitles panel ◀ ▶ switch columns.</sub>
+
+<sub>Testing on a Windows PC without a controller: arrows move, Enter selects (play/pause in the player), Esc or Backspace goes back, Home/End = LT/RT, PageUp/PageDown = LB/RB, Y and X open Audio & Subtitles, F1 shows the debug log, F4 plays a public sample video in the native player (with a pretend intro at 0:05–0:40) to try the player without a streaming server.</sub>
 
 </td>
 </tr>
@@ -168,6 +214,21 @@ Visual Studio 2022 with the UWP workload and Windows SDK 10.0.22621.
 2. Open `StremioXbox.sln`, **Release | x64**.
 3. Deploy to the Xbox as a Remote Machine, or Publish → Create App Packages → Sideloading and install
    through Device Portal.
+
+Or from a terminal, once this PC trusts the console's Device Portal certificate (download
+`https://<xbox>:11443/config/rootcertificate`, then `certutil -user -addstore Root <file>`):
+
+- `powershell -ExecutionPolicy Bypass -File scripts\Deploy-Xbox.ps1 -Xbox <ip>` installs the newest built
+  package with its dependencies and starts it (asks for the Device Portal login if one is set).
+- `powershell -ExecutionPolicy Bypass -File scripts\Get-XboxDiagnostics.ps1 -Xbox <ip>` saves a screenshot of the
+  console and the app's log into `diagnostics\`, to capture a problem while it is on screen.
+
+Two checks run without Visual Studio or an Xbox:
+
+- `node tests/shell-session.test.js` (Node 18+): the shell script's Stremio session logic.
+- `dotnet run -c Release --project tests/SeekBenchmark` (Windows, .NET SDK): the read buffer against a
+  simulated debrid server, timing seeks and checking every byte. Set `MBPS` and `COLD_MS` to change the
+  server's speed and first-byte delay.
 
 </details>
 

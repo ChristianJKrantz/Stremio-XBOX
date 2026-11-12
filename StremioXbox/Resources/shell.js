@@ -42,6 +42,26 @@
     }
     var lastHandledStream = null;
 
+    // One source of controller input. Stremio Web has its own gamepad support (Settings > Gamepad support):
+    // it polls navigator.getGamepads(), moves its own focus with the left stick and clicks with A. The app
+    // already reads the controller natively and moves its own highlight, so with both, two items were
+    // highlighted (Stremio's white focus and the app's purple one), they scrolled out of step, and A could
+    // act on the one the viewer was not looking at. Inside the app the page sees no gamepad at all.
+    var gamepadHidden = false;
+    if (host) {
+        try {
+            var noGamepads = function () { return []; };
+            Object.defineProperty(Navigator.prototype, 'getGamepads', { configurable: true, writable: true, value: noGamepads });
+            Object.defineProperty(navigator, 'getGamepads', { configurable: true, writable: true, value: noGamepads });
+            gamepadHidden = navigator.getGamepads().length === 0;
+        } catch (e) {
+            gamepadHidden = false;
+        }
+        ['gamepadconnected', 'gamepaddisconnected'].forEach(function (type) {
+            window.addEventListener(type, function (event) { event.stopImmediatePropagation(); }, true);
+        });
+    }
+
     function post(message) {
         try {
             if (host) {
@@ -96,11 +116,14 @@
                 var message = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
                 if (message && message.type === 'config') {
                     nativePlayerEnabled = message.nativePlayer !== false;
-                    log('info', 'Native player ' + (nativePlayerEnabled ? 'enabled' : 'disabled'));
+                    keyboardNavigation = message.keyboardNav === true;
+                    log('info', 'Native player ' + (nativePlayerEnabled ? 'enabled' : 'disabled') + ', keyboard navigation ' + (keyboardNavigation ? 'on' : 'off'));
                 } else if (message && message.type === 'nav') {
                     onNavigate(message.action);
                 } else if (message && message.type === 'refocusField') {
                     refocusField(message.id);
+                } else if (message && message.type === 'player') {
+                    onNativePlayer(message);
                 }
             } catch (e) {
                 log('error', 'Bad config message: ' + format(e));
@@ -111,10 +134,65 @@
     // ---- Controller navigation ----------------------------------------------------------
     // The app reads the controller natively and sends {type:'nav', action}. This moves a
     // highlight between focusable elements by screen position (spatial navigation).
-    var FOCUSABLE = 'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])';
+    var FOCUSABLE = 'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"]):not([data-focus-guard])';
+
+    // An open popup or dropdown, which navigation stays inside (as in Stremio Web's own gamepad code: a
+    // non-empty .modals-container, else an element whose classes contain "dropdown" and "open").
+    function openOverlay() {
+        var options = document.getElementById('__sx-menu');
+        if (options) {
+            return { kind: 'options', root: options };
+        }
+        var modals = document.querySelectorAll('.modals-container');
+        for (var i = 0; i < modals.length; i++) {
+            if (modals[i].children.length > 0) {
+                return { kind: 'modal', root: modals[i] };
+            }
+        }
+        var dropdown = document.querySelector('[class*="dropdown"][class*="open"]');
+        return dropdown ? { kind: 'dropdown', root: dropdown } : null;
+    }
+
+    // The button that opens a dropdown: next to the open list, inside the same menu element.
+    function dropdownToggle(dropdown) {
+        var menu = dropdown && dropdown.parentElement;
+        if (!menu) {
+            return null;
+        }
+        return Array.prototype.filter.call(menu.querySelectorAll(FOCUSABLE), function (el) {
+            return !dropdown.contains(el);
+        })[0] || null;
+    }
+
+    // B with a popup or dropdown open closes it (instead of leaving the page behind it).
+    function closeOverlay() {
+        var overlay = openOverlay();
+        if (!overlay) {
+            return false;
+        }
+        if (overlay.kind === 'options') {
+            closeOptions(true);
+        } else if (overlay.kind === 'modal') {
+            // Stremio's modals close on an Escape keydown at window level.
+            window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+        } else {
+            var toggle = dropdownToggle(overlay.root);
+            if (toggle) {
+                toggle.click(); // Escape does not close Stremio's dropdowns; their button does.
+                setTimeout(function () {
+                    if (toggle.isConnected && isCandidate(toggle)) {
+                        setFocus(toggle);
+                    }
+                }, 50);
+            }
+        }
+        return true;
+    }
     var FOCUS_CLASS = '__sx-focus';
-    var nativeNavigation = false;
+    var nativeNavigation = !!host;
+    var keyboardNavigation = false; // PC (not Xbox): arrows / Enter / Esc drive the same navigation.
     var lastKeyLog = 0;
+    var ANIM_CLASS = '__sx-anim';
 
     function isTyping(element) {
         return !!element && (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.isContentEditable);
@@ -140,8 +218,60 @@
         if (highlighted && highlighted.isConnected && isCandidate(highlighted)) {
             return highlighted;
         }
+        // Stremio redraws rows as catalogs load and update, replacing the highlighted poster with a new copy.
+        // Starting over from the top-left (the search bar) made the highlight jump up while scrolling; pick
+        // up the copy (same link) or whatever now sits where the highlight was.
+        if (highlighted && lastSpot) {
+            var replacement = findReplacement();
+            if (replacement) {
+                log('info', 'Highlight re-attached after the page redrew: ' + describeElement(replacement));
+                markHighlight(replacement);
+                return replacement;
+            }
+        }
         var active = document.activeElement;
         return active && active !== document.body && active !== document.documentElement && isCandidate(active) ? active : null;
+    }
+
+    // Where the highlight was last seen: its link, its centre on screen and the scroll position then.
+    var lastSpot = null;
+
+    function rememberSpot(element) {
+        var r = element.getBoundingClientRect();
+        var container = scrollParent(element, 'y');
+        lastSpot = {
+            href: element.getAttribute('href') || '',
+            x: r.left + r.width / 2,
+            y: r.top + r.height / 2,
+            container: container,
+            scroll: container ? container.scrollTop : 0,
+            scope: openOverlay() ? openOverlay().root : document
+        };
+    }
+
+    function findReplacement() {
+        var scope = lastSpot.scope && lastSpot.scope.isConnected ? lastSpot.scope : document;
+        var candidates = Array.prototype.filter.call(scope.querySelectorAll(FOCUSABLE), isCandidate);
+        if (lastSpot.href) {
+            var same = candidates.filter(function (el) { return el.getAttribute('href') === lastSpot.href; });
+            if (same.length) {
+                return same[0];
+            }
+        }
+        var shift = lastSpot.container && lastSpot.container.isConnected ? lastSpot.container.scrollTop - lastSpot.scroll : 0;
+        var x = lastSpot.x;
+        var y = lastSpot.y - shift;
+        var best = null;
+        var bestDistance = 260; // Only something close by; otherwise start fresh.
+        candidates.forEach(function (el) {
+            var r = el.getBoundingClientRect();
+            var d = Math.sqrt(Math.pow(r.left + r.width / 2 - x, 2) + Math.pow(r.top + r.height / 2 - y, 2));
+            if (d < bestDistance) {
+                bestDistance = d;
+                best = el;
+            }
+        });
+        return best;
     }
 
     // Lower is better: distance along the direction plus a penalty for sideways offset.
@@ -216,13 +346,36 @@
         })();
     }
 
-    function setFocus(element, block) {
+    // vertical: an up/down move; the page glides so the new row sits at the same height on screen, as TV
+    // apps do, rather than being left at the edge (where it sat half under Stremio's bottom banner).
+    // block: jump straight there instead (restoring the highlight after going back).
+    function setFocus(element, block, vertical) {
+        markHighlight(element);
+        if (block) {
+            element.scrollIntoView({ block: block, inline: 'nearest', behavior: 'auto' });
+        } else {
+            glideTo(element, vertical);
+        }
+        rememberSpot(element);
+        // After the glide settles, make sure nothing (a sticky header, Stremio's bottom banner) covers the item.
+        setTimeout(function () { ensureVisible(element); }, GLIDE_SETTLE_MS);
+    }
+
+    function markHighlight(element) {
+        setShield(true);
         focusByRoute[location.hash] = describeForRestore(element);
         var previous = document.querySelector('.' + FOCUS_CLASS);
         if (previous) {
-            previous.classList.remove(FOCUS_CLASS);
+            previous.classList.remove(FOCUS_CLASS, FOCUS_CLASS + '-zoom');
         }
         element.classList.add(FOCUS_CLASS);
+        var clip = clipKind(element);
+        element.classList.toggle(FOCUS_CLASS + '-inset', clip === 'row');
+        element.classList.toggle(FOCUS_CLASS + '-tight', clip === 'tight');
+        if (clip !== 'row' && element.querySelector('img')) {
+            // Posters grow a little when highlighted (and shrink back smoothly when left).
+            element.classList.add(ANIM_CLASS, FOCUS_CLASS + '-zoom');
+        }
         highlighted = element;
         if (isTyping(element)) {
             if (document.activeElement && document.activeElement !== document.body) {
@@ -231,10 +384,219 @@
         } else {
             element.focus({ preventScroll: true });
         }
-        element.scrollIntoView({ block: block || 'nearest', inline: 'nearest', behavior: block ? 'auto' : 'smooth' });
-        // After the scroll settles, re-centre if the item is off screen or covered (e.g. by a sticky header):
-        // on Settings the Log in / Sign up link ended up hidden while highlighted.
-        setTimeout(function () { ensureVisible(element); }, 400);
+    }
+
+    // ---- Hover shield --------------------------------------------------------------------------------------
+    // Stremio lights up a poster under the mouse pointer (a white frame). On the console the pointer stays
+    // where it was while the page scrolls under it, so a second, white highlight kept popping up next to the
+    // controller's. While the controller is in use a transparent sheet lies over the page and takes the
+    // pointer; moving a real mouse (or the app's cursor) removes it.
+    var shield = null;
+
+    function setShield(on) {
+        try {
+            if (on && !shield && document.body) {
+                var sheet = document.createElement('div');
+                sheet.id = '__sx-shield';
+                sheet.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:2147483647;background:transparent;';
+                document.body.appendChild(sheet);
+                shield = sheet;
+            }
+            if (shield) {
+                if (on && !shield.isConnected && document.body) {
+                    document.body.appendChild(shield);
+                }
+                shield.style.display = on ? 'block' : 'none';
+            }
+        } catch (e) {
+            log('warn', 'Hover shield unavailable: ' + format(e)); // Navigation works without it.
+        }
+    }
+
+    window.addEventListener('mousemove', function (event) {
+        if (shield && shield.style.display !== 'none' && (event.movementX || event.movementY)) {
+            setShield(false);
+        }
+    }, true);
+    document.addEventListener('mousedown', function () {
+        setShield(false);
+    }, true);
+
+    // The element under a point, looking through the shield.
+    function elementAt(x, y) {
+        var stack = document.elementsFromPoint ? document.elementsFromPoint(x, y) : [document.elementFromPoint(x, y)];
+        for (var i = 0; i < stack.length; i++) {
+            if (stack[i] && stack[i] !== shield) {
+                return stack[i];
+            }
+        }
+        return null;
+    }
+
+    // ---- Gliding scroll ----------------------------------------------------------------------------------
+    // Each move moves the page like a spring pulling it to its new position: it starts gently, never
+    // overshoots, and a press during a glide only moves the destination while keeping the current speed, so
+    // holding a direction scrolls in one continuous motion instead of a series of jolts.
+    var ROW_ANCHOR = 0.45;     // Up/down: the highlighted row's middle sits at 45 % of the screen height.
+    var EDGE_MARGIN = 56;      // Left/right: scroll only when the item comes within this many px of an edge.
+    var SPRING = 260;          // Spring stiffness (critically damped): settles in about 0.35 s.
+    var GLIDE_SETTLE_MS = 500;
+    var glides = [];
+    var externalScrolls = 0;
+    var frame = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : function (f) { return setTimeout(function () { f(Date.now()); }, 16); };
+
+    function isRoot(node) {
+        return node === document.scrollingElement || node === document.documentElement || node === document.body;
+    }
+
+    // The nearest ancestor that actually scrolls along the axis ('x' or 'y'), else the page itself.
+    function scrollParent(element, axis) {
+        for (var node = element.parentElement; node && !isRoot(node); node = node.parentElement) {
+            var style = getComputedStyle(node);
+            var overflow = axis === 'y' ? style.overflowY : style.overflowX;
+            var room = axis === 'y' ? node.scrollHeight - node.clientHeight : node.scrollWidth - node.clientWidth;
+            if (room > 1 && (overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay')) {
+                return node;
+            }
+        }
+        var root = document.scrollingElement || document.documentElement;
+        var rootRoom = axis === 'y' ? root.scrollHeight - root.clientHeight : root.scrollWidth - root.clientWidth;
+        return rootRoom > 1 ? root : null;
+    }
+
+    function visibleRect(container) {
+        if (isRoot(container)) {
+            return { top: 0, left: 0, bottom: innerHeight, right: innerWidth, height: innerHeight, width: innerWidth };
+        }
+        return container.getBoundingClientRect();
+    }
+
+    // How far to scroll so the span [start, end] sits nicely in [low, high]: anchored, or just inside the edges.
+    function scrollDelta(start, end, low, high, anchored) {
+        if (anchored && end - start < (high - low) * 0.8) {
+            return (start + end) / 2 - (low + (high - low) * ROW_ANCHOR);
+        }
+        if (start < low + EDGE_MARGIN) {
+            return start - (low + EDGE_MARGIN);
+        }
+        if (end > high - EDGE_MARGIN) {
+            return Math.min(end - (high - EDGE_MARGIN), start - (low + EDGE_MARGIN));
+        }
+        return 0;
+    }
+
+    function glide(container, axis, delta) {
+        if (Math.abs(delta) < 1) {
+            return;
+        }
+        var g = glides.filter(function (x) { return x.container === container && x.axis === axis; })[0];
+        var now = axis === 'y' ? container.scrollTop : container.scrollLeft;
+        var max = axis === 'y' ? container.scrollHeight - container.clientHeight : container.scrollWidth - container.clientWidth;
+        if (!g) {
+            g = { container: container, axis: axis, pos: now, speed: 0 };
+            glides.push(g);
+            container.style.scrollBehavior = 'auto'; // A CSS smooth scroll would fight the glide.
+        }
+        // The element was measured at the current scroll position, so aim from there.
+        g.target = Math.max(0, Math.min(max, now + delta));
+        if (g.running) {
+            return;
+        }
+        g.running = true;
+        g.last = 0;
+        frame(function step(time) {
+            if (g.cancelled) {
+                glides.splice(glides.indexOf(g), 1);
+                return;
+            }
+            var dt = (g.last ? Math.min(64, time - g.last) : 16.7) / 1000;
+            g.last = time;
+            var actual = axis === 'y' ? container.scrollTop : container.scrollLeft;
+            if (Math.abs(actual - g.pos) > 2) {
+                // Something else scrolled (the page re-rendered or Stremio scrolled): continue from there.
+                if (++externalScrolls <= 20) {
+                    log('info', 'Scroll moved outside the glide: ' + Math.round(g.pos) + ' -> ' + actual);
+                }
+                g.pos = actual;
+            }
+            // Critically damped spring, in small steps for stability.
+            var damping = 2 * Math.sqrt(SPRING);
+            for (var steps = Math.max(1, Math.ceil(dt / 0.008)), h = dt / steps, i = 0; i < steps; i++) {
+                g.speed += (SPRING * (g.target - g.pos) - damping * g.speed) * h;
+                g.pos += g.speed * h;
+            }
+            if (Math.abs(g.target - g.pos) < 0.5 && Math.abs(g.speed) < 8) {
+                g.pos = g.target;
+                g.speed = 0;
+            }
+            if (axis === 'y') {
+                container.scrollTop = g.pos;
+            } else {
+                container.scrollLeft = g.pos;
+            }
+            if (g.pos === g.target) {
+                glides.splice(glides.indexOf(g), 1);
+                return;
+            }
+            frame(step);
+        });
+    }
+
+    function glideTo(element, vertical) {
+        try {
+            var r = element.getBoundingClientRect();
+            var y = scrollParent(element, 'y');
+            if (y) {
+                var v = visibleRect(y);
+                var dy = scrollDelta(r.top, r.bottom, v.top, v.bottom, vertical);
+                glide(y, 'y', dy);
+                // A list inside a scrolling page (e.g. the stream list): keep the list itself in view too.
+                if (!isRoot(y)) {
+                    var outer = scrollParent(y, 'y');
+                    if (outer) {
+                        var o = visibleRect(outer);
+                        glide(outer, 'y', scrollDelta(r.top - dy, r.bottom - dy, o.top, o.bottom, false));
+                    }
+                }
+            }
+            var x = scrollParent(element, 'x');
+            if (x) {
+                var h = visibleRect(x);
+                glide(x, 'x', scrollDelta(r.left, r.right, h.left, h.right, false));
+            }
+        } catch (e) {
+            element.scrollIntoView({ block: vertical ? 'center' : 'nearest', inline: 'nearest', behavior: 'auto' });
+        }
+    }
+
+    // Wheel, touch or mouse: the user scrolls by hand, so stop any glide.
+    ['wheel', 'touchstart', 'mousedown'].forEach(function (type) {
+        window.addEventListener(type, function () {
+            glides.forEach(function (g) { g.cancelled = true; });
+        }, { capture: true, passive: true });
+    });
+
+    // Whether a ring drawn outside the element would be cut off by the nearest ancestor that clips its
+    // content: 'row' (fills most of its width), 'tight' (a small control right against its edge) or null.
+    function clipKind(element) {
+        var r = element.getBoundingClientRect();
+        var node = element.parentElement;
+        for (var depth = 0; node && node !== document.body && depth < 12; depth++, node = node.parentElement) {
+            var style = getComputedStyle(node);
+            if (style.overflowX !== 'visible' || style.overflowY !== 'visible') {
+                var c = node.getBoundingClientRect();
+                // Full-width rows (dropdown options, list entries) leave no room outside for the ring; a
+                // poster that is merely scrolled half out of view does, once it scrolls in.
+                if (r.width >= c.width * 0.8) {
+                    return 'row';
+                }
+                // Small controls right against the clipping edge (e.g. "Clear history") get a thin ring inside,
+                // except items that show a picture (posters), where it would sit under the image.
+                var tight = r.left - c.left < 6 || c.right - r.right < 6 || r.top - c.top < 6 || c.bottom - r.bottom < 6;
+                return tight && !element.querySelector('img') ? 'tight' : null;
+            }
+        }
+        return null;
     }
 
     function describeElement(element) {
@@ -251,23 +613,51 @@
             return;
         }
         var r = element.getBoundingClientRect();
-        var hit = document.elementFromPoint(r.left + r.width / 2, r.top + Math.min(r.height / 2, 20));
-        var covered = !hit || !(hit === element || element.contains(hit) || hit.contains(element));
-        var offScreen = r.top < 0 || r.bottom > innerHeight || r.left < 0 || r.right > innerWidth;
-        if (/^#\/settings/.test(location.hash)) {
-            log('info', 'Settings highlight: ' + describeElement(element) + (covered ? ', covered by ' + describeElement(hit) : '') + (offScreen ? ', off screen' : ''));
+        var y = scrollParent(element, 'y');
+        var view = y ? visibleRect(y) : { top: 0, bottom: innerHeight };
+        var top = Math.max(r.top, view.top, 0);
+        var bottom = Math.min(r.bottom, view.bottom, innerHeight);
+        if (bottom - top < Math.min(r.height, 40)) {
+            log('info', 'Highlight off screen after the glide, centring: ' + describeElement(element));
+            glideTo(element, true);
+            return;
         }
-        if (covered || offScreen) {
-            element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+        if (!y) {
+            return;
+        }
+        // Something on top of the item (a sticky header, Stremio's bottom banner): move just past it.
+        var cx = r.left + r.width / 2;
+        var hitTop = elementAt(cx, Math.max(top, 0) + 6);
+        var hitBottom = elementAt(cx, Math.min(bottom, innerHeight) - 6);
+        var coveredTop = hitTop && !(hitTop === element || element.contains(hitTop) || hitTop.contains(element));
+        var coveredBottom = hitBottom && !(hitBottom === element || element.contains(hitBottom) || hitBottom.contains(element));
+        var delta = 0;
+        if (coveredTop && !coveredBottom) {
+            delta = r.top - (hitTop.getBoundingClientRect().bottom + 16);
+        } else if (coveredBottom && !coveredTop) {
+            delta = r.bottom - (hitBottom.getBoundingClientRect().top - 16);
+        }
+        if (Math.abs(delta) >= 8 && Math.abs(delta) < view.bottom - view.top) {
+            log('info', 'Highlight covered by ' + describeElement(coveredTop ? hitTop : hitBottom) + ', moving ' + Math.round(delta) + ' px');
+            glide(y, 'y', delta);
+            rememberSpot(element);
         }
     }
 
-    function move(direction) {
-        var candidates = Array.prototype.filter.call(document.querySelectorAll(FOCUSABLE), isCandidate);
+        function move(direction) {
+        var overlay = openOverlay();
+        var scope = overlay ? overlay.root : document;
+        var candidates = Array.prototype.filter.call(scope.querySelectorAll(FOCUSABLE), isCandidate);
         if (candidates.length === 0) {
             return;
         }
         var from = current();
+        if (from && overlay && !overlay.root.contains(from)) {
+            // A popup just opened: start inside it, on its selected item if it marks one.
+            var selected = candidates.filter(function (el) { return /selected|checked|active/i.test(String(el.className)) || el.getAttribute('aria-selected') === 'true'; })[0];
+            setFocus(selected || candidates[0]);
+            return;
+        }
         if (!from) {
             // Nothing focused yet: start from the top-left-most visible element.
             var visible = candidates.filter(function (el) {
@@ -296,7 +686,7 @@
             }
         });
         if (best) {
-            setFocus(best);
+            setFocus(best, null, direction === 'up' || direction === 'down');
         }
     }
 
@@ -346,6 +736,16 @@
 
     function onNavigate(action) {
         nativeNavigation = true;
+        document.documentElement.classList.add('__sx-nav');
+        setShield(true);
+        if (action === 'menu') {
+            if (document.getElementById('__sx-menu')) {
+                closeOptions(true);
+            } else if (!/^#\/player\//.test(location.hash)) {
+                openOptions(current());
+            }
+            return;
+        }
         if (/^#\/player\//.test(location.hash)) {
             if (action === 'activate') {
                 pressKey(' ', 'Space', 32);
@@ -373,7 +773,16 @@
                 if (/^#\/settings/.test(location.hash)) {
                     log('info', 'Settings activate: ' + describeElement(from));
                 }
+                var dropdown = openOverlay();
+                var toggle = dropdown && dropdown.kind === 'dropdown' && dropdown.root.contains(from) ? dropdownToggle(dropdown.root) : null;
                 from.click();
+                if (toggle) {
+                    setTimeout(function () {
+                        if (toggle.isConnected && isCandidate(toggle)) {
+                            setFocus(toggle);
+                        }
+                    }, 150);
+                }
             } else {
                 move('down');
             }
@@ -385,10 +794,183 @@
         move(action);
     }
 
+    // ---- Title options (Menu button) ---------------------------------------------------------------------
+    // Menu on a poster opens a card with what Stremio offers for that title: play / resume, details, add to
+    // or remove from the library, mark as watched, remove from Continue Watching. The actions are Stremio's
+    // own (the same core calls its poster menus and detail page make), so the library stays in sync.
+    var optionsReturn = null;
+
+    function titleOf(element) {
+        var link = element && (element.closest('a[href]') || element.querySelector('a[href]'));
+        var href = link ? link.getAttribute('href') || '' : '';
+        var m = /^#\/detail\/([^/?]+)\/([^/?]+)(?:\/([^/?]+))?/.exec(href);
+        if (m) {
+            return { type: decodeURIComponent(m[1]), id: decodeURIComponent(m[2]), videoId: m[3] ? decodeURIComponent(m[3]) : null, href: href };
+        }
+        m = /^#\/player\/[^/]+\/[^/]+\/[^/]+\/([^/?]+)\/([^/?]+)(?:\/([^/?]+))?/.exec(href);
+        if (m) {
+            return { type: decodeURIComponent(m[1]), id: decodeURIComponent(m[2]), videoId: m[3] ? decodeURIComponent(m[3]) : null, href: href, player: href };
+        }
+        return null;
+    }
+
+    // Looks through Stremio's models for this title: its library entry (with progress) and a preview of it
+    // (what "add to library" needs), and whether it is in Continue Watching.
+    function lookUpTitle(id) {
+        var models = ['continue_watching_preview', 'continue_watching', 'library', 'board', 'discover', 'search', 'meta_details'];
+        return Promise.all(models.map(function (model) {
+            return coreCall(function (core) { return core.getState(model); }, null);
+        })).then(function (states) {
+            var found = { libraryItem: null, preview: null, continueWatching: false, playLink: null };
+            states.forEach(function (state, index) {
+                (function walk(value, depth) {
+                    if (!value || typeof value !== 'object' || depth > 7) {
+                        return;
+                    }
+                    if (Array.isArray(value)) {
+                        value.forEach(function (v) { walk(v, depth + 1); });
+                        return;
+                    }
+                    if (value._id === id && value.state) {
+                        found.libraryItem = found.libraryItem || value;
+                        if (index <= 1) {
+                            found.continueWatching = true;
+                        }
+                        if (!found.playLink && value.deepLinks && typeof value.deepLinks.player === 'string') {
+                            found.playLink = value.deepLinks.player;
+                        }
+                    } else if (value.id === id && typeof value.type === 'string' && typeof value.name === 'string' && !found.preview) {
+                        found.preview = value;
+                    }
+                    for (var key in value) {
+                        if (Object.prototype.hasOwnProperty.call(value, key) && key !== 'addon' && key !== 'manifest') {
+                            walk(value[key], depth + 1);
+                        }
+                    }
+                })(state, 0);
+            });
+            return found;
+        });
+    }
+
+    function libraryAction(action, args) {
+        return coreDispatch({ action: 'Ctx', args: { action: action, args: args } });
+    }
+
+    function openOptions(from) {
+        var title = titleOf(from);
+        if (!title) {
+            log('info', 'Menu: no title options for ' + describeElement(from));
+            return;
+        }
+        optionsReturn = from;
+        lookUpTitle(title.id).then(function (info) {
+            if (!document.body || document.getElementById('__sx-menu')) {
+                return;
+            }
+            var item = info.libraryItem;
+            var inLibrary = !!item && !item.removed && !item.temp;
+            var watched = !!item && item.state && (item.state.timesWatched > 0 || item.state.flaggedWatched === 1);
+            var name = (item && item.name) || (info.preview && info.preview.name) || (from.textContent || '').trim() || 'This title';
+            var poster = (item && item.poster) || (info.preview && info.preview.poster) || '';
+            var choices = [];
+            var resume = info.playLink || title.player;
+            if (resume) {
+                choices.push({ label: info.continueWatching ? 'Resume' : 'Play', run: function () { location.hash = resume.replace(/^#?/, '#'); } });
+            }
+            choices.push({ label: 'Details', run: function () { location.hash = title.href.replace(/^#?/, '#'); } });
+            if (inLibrary) {
+                choices.push({ label: 'Remove from Library', run: function () { return libraryAction('RemoveFromLibrary', title.id); } });
+            } else if (info.preview || item) {
+                choices.push({ label: 'Add to Library', run: function () { return libraryAction('AddToLibrary', info.preview || item); } });
+            }
+            if (item) {
+                choices.push({ label: watched ? 'Mark as unwatched' : 'Mark as watched', run: function () { return libraryAction('LibraryItemMarkAsWatched', { id: title.id, is_watched: !watched }); } });
+            }
+            if (info.continueWatching) {
+                choices.push({ label: 'Remove from Continue Watching', run: function () {
+                    return Promise.all([libraryAction('RewindLibraryItem', title.id), libraryAction('DismissNotificationItem', title.id)]);
+                } });
+            }
+            log('info', 'Menu for "' + name + '" (' + title.id + '): ' + choices.map(function (c) { return c.label; }).join(', '));
+            showOptions(name, poster, choices);
+        });
+    }
+
+    function showOptions(name, poster, choices) {
+        var root = document.createElement('div');
+        root.id = '__sx-menu';
+        var card = document.createElement('div');
+        card.className = '__sx-menu-card';
+        if (poster) {
+            var img = document.createElement('div');
+            img.className = '__sx-menu-poster';
+            img.style.backgroundImage = 'url("' + String(poster).replace(/"/g, '%22') + '")';
+            card.appendChild(img);
+        }
+        var body = document.createElement('div');
+        body.className = '__sx-menu-body';
+        var heading = document.createElement('div');
+        heading.className = '__sx-menu-title';
+        heading.textContent = name;
+        body.appendChild(heading);
+        choices.forEach(function (choice) {
+            var button = document.createElement('button');
+            button.className = '__sx-menu-item';
+            button.textContent = choice.label;
+            button.addEventListener('click', function () {
+                var keepFocus = /Library|watched|Continue/.test(choice.label);
+                closeOptions(keepFocus);
+                Promise.resolve(choice.run()).then(function () {
+                    if (keepFocus) {
+                        showToast(name + ': ' + choice.label.replace(/^Add to/, 'added to').replace(/^Remove from/, 'removed from').replace(/^Mark as/, 'marked as'));
+                    }
+                });
+            });
+            body.appendChild(button);
+        });
+        var hint = document.createElement('div');
+        hint.className = '__sx-menu-hint';
+        hint.textContent = 'A  Select     B  Close';
+        body.appendChild(hint);
+        card.appendChild(body);
+        root.appendChild(card);
+        document.body.appendChild(root);
+        var first = root.querySelector('button');
+        if (first) {
+            setFocus(first, null, false);
+        }
+    }
+
+    function closeOptions(restore) {
+        var root = document.getElementById('__sx-menu');
+        if (root) {
+            root.parentNode.removeChild(root);
+        }
+        var back = optionsReturn;
+        optionsReturn = null;
+        if (restore && back && back.isConnected && isCandidate(back)) {
+            setFocus(back, null, false);
+        }
+    }
+
+    // A short note at the top of the page (e.g. "added to Library").
+    function showToast(text) {
+        var toast = document.createElement('div');
+        toast.className = '__sx-toast';
+        toast.textContent = text;
+        document.body.appendChild(toast);
+        setTimeout(function () { toast.classList.add('__sx-toast-out'); }, 2200);
+        setTimeout(function () { if (toast.parentNode) { toast.parentNode.removeChild(toast); } }, 2700);
+    }
+
     // Raw keys from WebView2 itself: logged (to learn what the Xbox sends) and, once native
     // navigation is active, swallowed so a D-pad press is not handled twice.
-    document.addEventListener('keydown', function (event) {
+    window.addEventListener('keydown', function (event) {
         if (!event.isTrusted) {
+            return;
+        }
+        if (keyboardNavigation && onKeyboardNavigation(event)) {
             return;
         }
         if (Date.now() - lastKeyLog > 2000) {
@@ -397,7 +979,7 @@
         }
         // Controller B (WebView2 sends keyCode 27 with key "Unidentified", or GamepadB) when the page has
         // focus. Off the home screen it goes back in Stremio's own history; on home it is left as it was.
-        if (((event.keyCode === 27 && event.key !== 'Escape') || event.key === 'GamepadB') && !isHome() &&
+        if (((event.keyCode === 27 && event.key !== 'Escape') || event.key === 'GamepadB') && (!isHome() || openOverlay()) &&
             !isTyping(document.activeElement)) {
             event.preventDefault();
             event.stopImmediatePropagation();
@@ -408,14 +990,68 @@
             return;
         }
         var typing = isTyping(event.target);
-        var isArrow = /^Arrow/.test(event.key);
-        if ((isArrow && !(typing && (event.key === 'ArrowLeft' || event.key === 'ArrowRight'))) ||
-            (event.key === 'Enter' && !typing) ||
-            /^Gamepad/.test(event.key)) {
+        // On the Xbox, WebView2 hands the controller to the page as keys named "Unidentified" carrying arrow
+        // (37-40), Enter (13) or gamepad (195-218, e.g. 207 = Menu) key codes. Matching only key names let
+        // them through, so each D-pad press also scrolled the page natively and moved Stremio's own focus:
+        // the jumpy scrolling, the sideways bounce and the second highlight. Match by key code instead.
+        var code = event.keyCode;
+        var isArrow = /^Arrow/.test(event.key) || (code >= 37 && code <= 40);
+        var isSideways = event.key === 'ArrowLeft' || event.key === 'ArrowRight' || code === 37 || code === 39;
+        var isEnter = event.key === 'Enter' || code === 13;
+        var isPad = /^Gamepad/.test(event.key) || (code >= 195 && code <= 218);
+        if ((isArrow && !(typing && isSideways)) || (isEnter && !typing) || isPad) {
             event.preventDefault();
             event.stopImmediatePropagation();
         }
     }, true);
+
+    // The same keys must not reach Stremio on release either (it acts on some keys on keyup).
+    window.addEventListener('keyup', function (event) {
+        if (!event.isTrusted || !nativeNavigation || keyboardNavigation) {
+            return;
+        }
+        var code = event.keyCode;
+        if (isTyping(event.target)) {
+            return;
+        }
+        if ((code >= 37 && code <= 40) || code === 13 || (code >= 195 && code <= 218) || /^(Arrow|Gamepad)/.test(event.key)) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        }
+    }, true);
+
+    // PC testing without a controller: the keyboard drives the same navigation as the D-pad.
+    function onKeyboardNavigation(event) {
+        var typing = isTyping(document.activeElement);
+        var actions = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right' };
+        var action = actions[event.key];
+        if (event.key === 'Enter' && !typing) {
+            action = 'activate';
+        }
+        if (!typing && (event.key === 'ContextMenu' || event.key === 'm' || event.key === 'M')) {
+            action = 'menu';
+        }
+        if (typing && (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'Enter')) {
+            return false; // Caret and form submit stay with the field.
+        }
+        if (event.key === 'Escape' || (event.key === 'Backspace' && !typing)) {
+            if (typing) {
+                document.activeElement.blur();
+            } else {
+                window.__sxBack();
+            }
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return true;
+        }
+        if (!action || event.ctrlKey || event.altKey || event.metaKey) {
+            return false;
+        }
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onNavigate(action);
+        return true;
+    }
 
     // Mouse use clears the controller highlight.
     document.addEventListener('mousedown', function () {
@@ -423,12 +1059,32 @@
         if (highlighted) {
             highlighted.classList.remove(FOCUS_CLASS);
         }
+        document.documentElement.classList.remove('__sx-nav'); // Pointer in use: Stremio's own focus styles again.
     }, true);
 
     function addFocusStyle() {
         var style = document.createElement('style');
-        style.textContent = '.' + FOCUS_CLASS + '{outline:4px solid #7B5BF5 !important;outline-offset:3px !important;' +
-            'box-shadow:0 0 0 8px rgba(123,91,245,.35) !important;border-radius:8px;}';
+        style.textContent = '.' + FOCUS_CLASS + ',.' + FOCUS_CLASS + ':focus,.' + FOCUS_CLASS + ':focus-visible{outline:4px solid #7B5BF5 !important;outline-offset:3px !important;' +
+            'box-shadow:0 0 0 8px rgba(123,91,245,.35) !important;border-radius:8px;}' +
+            '.' + FOCUS_CLASS + '-inset.' + FOCUS_CLASS + '{outline-offset:-4px !important;box-shadow:inset 0 0 0 10px rgba(123,91,245,.35) !important;}' +
+            '.' + FOCUS_CLASS + '-tight.' + FOCUS_CLASS + '{outline-width:2px !important;outline-offset:-2px !important;box-shadow:none !important;}' +
+            '#__sx-menu{position:fixed;left:0;top:0;right:0;bottom:0;z-index:2147483646;background:rgba(0,0,0,.62);display:flex;align-items:center;justify-content:center;animation:__sx-fade .18s ease-out;}' +
+            '.__sx-menu-card{display:flex;gap:28px;min-width:560px;max-width:760px;padding:28px;border-radius:16px;background:rgba(22,20,28,.96);box-shadow:0 24px 80px rgba(0,0,0,.7);animation:__sx-rise .22s cubic-bezier(.2,.8,.2,1);}' +
+            '.__sx-menu-poster{flex:0 0 170px;height:255px;border-radius:10px;background:#222 center/cover no-repeat;}' +
+            '.__sx-menu-body{flex:1;display:flex;flex-direction:column;min-width:0;}' +
+            '.__sx-menu-title{font-size:28px;font-weight:600;color:#fff;margin:4px 6px 18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
+            '.__sx-menu-item{display:block;width:100%;text-align:left;font:inherit;font-size:21px;color:rgba(255,255,255,.85);background:transparent;border:0;border-radius:8px;padding:12px 16px;margin:2px 0;cursor:pointer;}' +
+            '.__sx-menu-item.' + FOCUS_CLASS + '{background:rgba(255,255,255,.14);color:#fff;font-weight:600;}' +
+            '.__sx-menu-hint{margin:18px 6px 0;font-size:15px;color:rgba(255,255,255,.5);}' +
+            '.__sx-toast{position:fixed;top:40px;left:50%;transform:translateX(-50%);z-index:2147483646;padding:14px 26px;border-radius:10px;background:rgba(22,20,28,.95);color:#fff;font-size:19px;box-shadow:0 10px 40px rgba(0,0,0,.5);animation:__sx-fade .2s ease-out;transition:opacity .4s;}' +
+            '.__sx-toast-out{opacity:0;}' +
+            '@keyframes __sx-fade{from{opacity:0}to{opacity:1}}' +
+            '@keyframes __sx-rise{from{opacity:0;transform:translateY(16px) scale(.98)}to{opacity:1;transform:none}}' +
+            // Highlighted posters grow slightly; the transition stays on them so they also shrink back smoothly.
+            '.' + ANIM_CLASS + '{transition:transform .22s cubic-bezier(.2,.8,.2,1),outline-offset .22s ease !important;}' +
+            '.' + FOCUS_CLASS + '-zoom.' + FOCUS_CLASS + '{transform:scale(1.06) !important;}' +
+            // Nothing else shows Stremio's own focus ring while the controller drives the page.
+            'html.__sx-nav :focus:not(.' + FOCUS_CLASS + '),html.__sx-nav :focus-visible:not(.' + FOCUS_CLASS + '){outline:none !important;}';
         (document.head || document.documentElement).appendChild(style);
     }
 
@@ -541,6 +1197,287 @@
         });
     }
 
+    // ---- Stremio's own player model, driven by the native player -----------------------------
+    // Stremio Web exposes its core as window.core. Loading the "player" model with the same
+    // arguments the web player uses, then feeding it TimeChanged / PausedChanged / Ended from the
+    // native player, gives the native player what the web player gets: resume position, Continue
+    // Watching, watched marks, the real title and the next episode (binge watching).
+    var PLAYER_DEVICE = 'Stremio-XBOX';
+    var CORE_INFO_TIMEOUT_MS = 3500;
+    var NEXT_POLL_MS = 5000;
+    var session = null;
+
+    function coreAvailable() {
+        return !!(window.core && typeof window.core.dispatch === 'function' && typeof window.core.getState === 'function');
+    }
+
+    function coreCall(run, fallback) {
+        if (!coreAvailable()) {
+            return Promise.resolve(fallback);
+        }
+        try {
+            return Promise.resolve(run(window.core)).catch(function (e) {
+                log('warn', 'Stremio core call failed: ' + format(e));
+                return fallback;
+            });
+        } catch (e) {
+            log('warn', 'Stremio core call failed: ' + format(e));
+            return Promise.resolve(fallback);
+        }
+    }
+
+    function coreDispatch(action, field) {
+        return coreCall(function (core) { return core.dispatch(action, field); }, null);
+    }
+
+    function playerAction(action, args) {
+        return coreDispatch({ action: 'Player', args: args === undefined ? { action: action } : { action: action, args: args } }, 'player');
+    }
+
+    function playerState() {
+        return coreCall(function (core) { return core.getState('player'); }, null);
+    }
+
+    function stremioSettings() {
+        var fallback = (readProfile() || {}).settings || {};
+        return coreCall(function (core) { return core.getState('ctx'); }, null).then(function (ctx) {
+            return (ctx && ctx.profile && ctx.profile.settings) || fallback;
+        });
+    }
+
+    function readyContent(loadable) {
+        return loadable && loadable.type === 'Ready' ? loadable.content : null;
+    }
+
+    // Route parts: <stream>/<streamTransportUrl>/<metaTransportUrl>/<type>/<id>/<videoId>, built into
+    // the same Load arguments as Stremio Web's player.
+    function playerLoadArgs(stream, parts) {
+        var streamTransportUrl = parts[1] || null;
+        var metaTransportUrl = parts[2] || null;
+        var type = parts[3] || null;
+        var id = parts[4] || null;
+        var videoId = parts[5] || null;
+        return {
+            stream: stream,
+            streamRequest: streamTransportUrl && type && videoId ? { base: streamTransportUrl, path: { resource: 'stream', type: type, id: videoId, extra: [] } } : null,
+            metaRequest: metaTransportUrl && type && id ? { base: metaTransportUrl, path: { resource: 'meta', type: type, id: id, extra: [] } } : null,
+            subtitlesPath: type && videoId ? { resource: 'subtitles', type: type, id: videoId, extra: [] } : null
+        };
+    }
+
+    function startSession(stream, parts) {
+        if (session) {
+            endSession(session, null);
+        }
+        var loadArgs = playerLoadArgs(stream, parts);
+        session = {
+            id: Date.now(),
+            loadArgs: loadArgs,
+            videoId: loadArgs.streamRequest ? loadArgs.streamRequest.path.id : null,
+            loadRequested: false,
+            paused: null,
+            next: null,
+            timer: null
+        };
+        return session;
+    }
+
+    // The web player unloads the model when it unmounts; load ours only after that.
+    function waitUntilLeftPlayer() {
+        return new Promise(function (resolve) {
+            var tries = 0;
+            (function check() {
+                if (!/^#\/player\//.test(location.hash) || ++tries > 60) {
+                    setTimeout(resolve, 400);
+                } else {
+                    setTimeout(check, 50);
+                }
+            })();
+        });
+    }
+
+    // Resolves with the player state once the title is known (or after a few seconds); never rejects.
+    function loadSession(s) {
+        if (!coreAvailable()) {
+            log('warn', 'Stremio core not found; watch progress will not be saved.');
+            return Promise.resolve(null);
+        }
+        return waitUntilLeftPlayer().then(function () {
+            if (s !== session) {
+                return null;
+            }
+            s.loadRequested = true;
+            return coreDispatch({ action: 'Load', args: { model: 'Player', args: s.loadArgs } }, 'player').then(function () {
+                var started = Date.now();
+                return new Promise(function (resolve) {
+                    (function poll() {
+                        playerState().then(function (state) {
+                            var metaSettled = !s.loadArgs.metaRequest || (state && state.metaItem && state.metaItem.type !== 'Loading');
+                            if ((state && state.selected && metaSettled) || Date.now() - started > CORE_INFO_TIMEOUT_MS || s !== session) {
+                                resolve(state);
+                            } else {
+                                setTimeout(poll, 200);
+                            }
+                        });
+                    })();
+                });
+            });
+        });
+    }
+
+    function describeNext(video) {
+        if (!video || !video.deepLinks || !(video.deepLinks.player || video.deepLinks.metaDetailsStreams)) {
+            return null;
+        }
+        var episode = typeof video.season === 'number' && typeof video.episode === 'number' ? 'S' + video.season + ' E' + video.episode : '';
+        return [episode, video.title || video.name || ''].filter(Boolean).join(' · ') || 'Next episode';
+    }
+
+    // Stremio's intro timing for this video (ms), when it knows it: { from, to } or null.
+    function describeIntro(state) {
+        var io = state && state.introOutro;
+        var intro = io && io.intro;
+        if (intro && typeof intro.from === 'number' && typeof intro.to === 'number' && intro.to > intro.from) {
+            return { from: intro.from, to: intro.to };
+        }
+        return null;
+    }
+
+    function introKey(intro) {
+        return intro ? intro.from + '-' + intro.to : '';
+    }
+
+    function describeSession(state, s) {
+        var info = { title: '', subtitle: '', background: '', resumeMs: 0, next: null, intro: null };
+        if (!state) {
+            return info;
+        }
+        var meta = readyContent(state.metaItem);
+        var video = null;
+        if (meta && Array.isArray(meta.videos)) {
+            video = meta.videos.filter(function (v) { return v && v.id === s.videoId; })[0] || null;
+        }
+        info.title = (meta && meta.name) || (typeof state.title === 'string' ? state.title : '');
+        var series = state.seriesInfo;
+        var episode = series && typeof series.season === 'number' && typeof series.episode === 'number' ? 'S' + series.season + ' E' + series.episode : '';
+        var videoTitle = video ? (video.title || video.name || '') : '';
+        info.subtitle = [episode, videoTitle !== info.title ? videoTitle : ''].filter(Boolean).join(' · ');
+        info.background = (meta && (meta.background || meta.poster)) || '';
+        // Same rule as Stremio Web: resume only when the library item was last on this very video.
+        var item = state.libraryItem;
+        if (item && item.state && s.videoId && item.state.video_id === s.videoId && item.state.timeOffset > 0) {
+            info.resumeMs = item.state.timeOffset;
+        }
+        info.next = describeNext(state.nextVideo);
+        info.intro = describeIntro(state);
+        return info;
+    }
+
+    // The next episode (and its binge stream) can resolve after playback starts; tell the app when it does.
+    function watchNext(s, initial, intro) {
+        s.next = initial || null;
+        s.intro = introKey(intro);
+        s.timer = setInterval(function () {
+            if (s !== session) {
+                clearInterval(s.timer);
+                return;
+            }
+            playerState().then(function (state) {
+                var label = state ? describeNext(state.nextVideo) : null;
+                if (s === session && label !== s.next) {
+                    s.next = label;
+                    post({ type: 'nextInfo', session: s.id, next: label || '' });
+                }
+                var later = state ? describeIntro(state) : null;
+                if (s === session && introKey(later) !== s.intro) {
+                    s.intro = introKey(later);
+                    post({ type: 'introInfo', session: s.id, introFrom: later ? later.from : 0, introTo: later ? later.to : 0 });
+                }
+            });
+        }, NEXT_POLL_MS);
+    }
+
+    function reportTime(s, message) {
+        if (!s.loadRequested || !message) {
+            return;
+        }
+        // Times are ms. A zero time (e.g. stopped while still buffering) must not wipe the saved position.
+        if (typeof message.time === 'number' && message.time > 0 && typeof message.duration === 'number' && message.duration > 0) {
+            playerAction('TimeChanged', { time: Math.round(message.time), duration: Math.round(message.duration), device: PLAYER_DEVICE });
+        }
+        if (typeof message.paused === 'boolean' && message.paused !== s.paused) {
+            s.paused = message.paused;
+            playerAction('PausedChanged', { paused: message.paused });
+        }
+    }
+
+    function endSession(s, message) {
+        reportTime(s, message);
+        if (s.timer) {
+            clearInterval(s.timer);
+        }
+        if (s.loadRequested) {
+            // Unloading makes Stremio save the library item (local storage and, when signed in, the API).
+            coreDispatch({ action: 'Unload' }, 'player');
+        }
+        if (session === s) {
+            session = null;
+        }
+    }
+
+    function navigateTo(link) {
+        var hash = link.charAt(0) === '#' ? link : '#' + link.replace(/^stremio:\/\/\/?/, '/');
+        log('info', 'Next video: ' + hash.slice(0, 120));
+        location.hash = hash;
+    }
+
+    // Playback ended (auto) or the viewer asked for the next episode: same choices as Stremio Web.
+    // Ended with binge watching on: the next episode's binge stream, else its stream list.
+    // Ended with binge watching off: stay where we are. Asked for next: binge stream, else stream list.
+    function finishSession(s, message, ended) {
+        reportTime(s, message);
+        if (ended && s.loadRequested) {
+            playerAction('Ended');
+        }
+        Promise.all([s.loadRequested ? playerState() : Promise.resolve(null), stremioSettings()]).then(function (results) {
+            var next = results[0] && results[0].nextVideo;
+            var links = (next && next.deepLinks) || {};
+            var target = !ended || results[1].bingeWatching !== false ? (links.player || links.metaDetailsStreams || null) : null;
+            endSession(s, null);
+            if (target) {
+                navigateTo(target);
+            }
+            if (!target || !/^#\/player\//.test(target.charAt(0) === '#' ? target : '#' + target)) {
+                post({ type: 'playerIdle' }); // The app leaves its loading screen; a player route posts 'preparing' instead.
+            }
+        });
+    }
+
+    // Events from the native player: {type:'player', event, session, time, duration, paused}.
+    function onNativePlayer(message) {
+        var s = session && session.id === message.session ? session : null;
+        switch (message.event) {
+            case 'progress':
+                if (s) { reportTime(s, message); }
+                break;
+            case 'stopped':
+                if (s) { endSession(s, message); }
+                break;
+            case 'cancel':
+            case 'failed':
+                if (s) { endSession(s, null); }
+                break;
+            case 'ended':
+            case 'next':
+                if (s) {
+                    finishSession(s, message, message.event === 'ended');
+                } else {
+                    post({ type: 'playerIdle' });
+                }
+                break;
+        }
+    }
+
     // Back for both B paths (page key and the app's system back): Stremio routes with history.pushState,
     // which WebView2's GoBack does not follow, so use the page's history. One press may arrive through
     // both paths; act once.
@@ -549,6 +1486,10 @@
         return location.hash === '' || location.hash === '#' || location.hash === '#/';
     }
     window.__sxBack = function () {
+        if (Date.now() - lastBack > 500 && closeOverlay()) {
+            lastBack = Date.now();
+            return true;
+        }
         if (isHome()) {
             return false;
         }
@@ -593,19 +1534,46 @@
 
             var hints = stream.behaviorHints || {};
             stopWebPlayer();
+            var s = startSession(stream, parts);
+            // The native player shows its loading screen right away while subtitles and Stremio's info load.
+            post({ type: 'preparing', session: s.id, name: stream.name || '' });
             // Leave the web player route so it does not keep loading the same file.
             history.back();
 
-            collectSubtitles(stream, type, videoId).then(function (subtitles) {
+            function postPlay(subtitles, info, settings) {
+                if (s !== session) {
+                    return; // Cancelled (B on the loading screen) or replaced.
+                }
                 post({
                     type: 'play',
+                    session: s.id,
                     url: stream.url,
                     name: stream.name || '',
                     description: stream.description || stream.title || '',
                     filename: hints.filename || '',
                     hasRequestHeaders: !!(hints.proxyHeaders && hints.proxyHeaders.request),
-                    subtitles: subtitles
+                    subtitles: subtitles,
+                    title: info.title,
+                    subtitle: info.subtitle,
+                    background: info.background,
+                    startPosition: info.resumeMs,
+                    introFrom: info.intro ? info.intro.from : 0,
+                    introTo: info.intro ? info.intro.to : 0,
+                    next: info.next || '',
+                    binge: settings.bingeWatching !== false,
+                    subtitlesLanguage: settings.subtitlesLanguage || '',
+                    audioLanguage: settings.audioLanguage || ''
                 });
+                watchNext(s, info.next, info.intro);
+            }
+
+            Promise.all([collectSubtitles(stream, type, videoId), loadSession(s), stremioSettings()]).then(function (results) {
+                var info = describeSession(results[1], s);
+                log('info', 'Session: "' + info.title + '" ' + info.subtitle + ', resume ' + Math.round(info.resumeMs / 1000) + ' s, next ' + (info.next || 'none'));
+                postPlay(results[0], info, results[2] || {});
+            }).catch(function (e) {
+                log('error', 'Preparing playback failed: ' + format(e));
+                postPlay([], describeSession(null, s), {});
             });
         }).catch(function (e) {
             log('error', 'Could not decode player stream: ' + format(e));
@@ -627,6 +1595,10 @@
     window.addEventListener('DOMContentLoaded', function () {
         log('info', 'User agent: ' + navigator.userAgent);
         log(bridgeHidden ? 'info' : 'warn', 'WebView2 bridge hidden from Stremio Web: ' + bridgeHidden);
+        log(gamepadHidden ? 'info' : 'warn', 'Gamepad hidden from Stremio Web (the app drives navigation): ' + gamepadHidden);
+        if (host) {
+            document.documentElement.classList.add('__sx-nav');
+        }
         addFocusStyle();
         onRouteChanged();
     });

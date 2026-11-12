@@ -12,6 +12,16 @@
         <TextBox x:Name="ProxyText" Opacity="0" Width="2" Height="2" MinWidth="0" MinHeight="0" Padding="0"
                  HorizontalAlignment="Left" VerticalAlignment="Top" IsHitTestVisible="False" IsTabStop="False" IsSpellCheckEnabled="False" IsTextPredictionEnabled="False" />
 
+        <!-- Startup and connection screen over the page: loading, can't connect (A retries), page crashed. -->
+        <Grid x:Name="StatusLayer" Background="#0C0B11">
+            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="900">
+                <ProgressRing x:Name="StatusRing" IsActive="True" Width="72" Height="72" Foreground="#7B5BF5" Margin="0,0,0,28" />
+                <TextBlock x:Name="StatusTitle" Text="Loading Stremio" FontSize="34" Foreground="White" HorizontalAlignment="Center" TextAlignment="Center" />
+                <TextBlock x:Name="StatusText" FontSize="20" Foreground="#CCFFFFFF" Margin="0,12,0,0" TextWrapping="Wrap" HorizontalAlignment="Center" TextAlignment="Center" Visibility="Collapsed" />
+                <TextBlock x:Name="StatusHint" FontSize="20" Foreground="#B39DFF" Margin="0,28,0,0" HorizontalAlignment="Center" Visibility="Collapsed" />
+            </StackPanel>
+        </Grid>
+
         <!-- The app's own cursor (left stick moves, A clicks, right stick scrolls); drawn over the page. -->
         <Canvas x:Name="CursorLayer" IsHitTestVisible="False" Visibility="Collapsed">
             <Ellipse x:Name="CursorDot" Width="28" Height="28" Fill="#B3FFFFFF" Stroke="#7B5BF5" StrokeThickness="3" />
@@ -25,16 +35,130 @@
                 HorizontalAlignment="Stretch"
                 VerticalAlignment="Stretch" />
 
-            <!-- Minimal on-screen bar; controller input is handled in code (A/Menu pause, Y audio, X subtitles, D-pad +-10 s, LB/RB +-60 s). -->
-            <Grid x:Name="Osd" VerticalAlignment="Bottom" Padding="64,24,64,40" Background="#B3000000" Visibility="Collapsed">
-                <StackPanel>
-                    <TextBlock x:Name="OsdTitle" FontSize="22" Foreground="White" TextTrimming="CharacterEllipsis" />
-                    <TextBlock x:Name="OsdInfo" FontSize="20" Foreground="#FFD54F" Margin="0,8,0,0" Visibility="Collapsed" TextTrimming="CharacterEllipsis" />
-                    <ProgressBar x:Name="OsdProgress" Minimum="0" Maximum="1" Height="6" Margin="0,14,0,10" Foreground="#7B5BF5" />
-                    <TextBlock x:Name="OsdTime" FontSize="18" Foreground="#CCFFFFFF" />
+            <!-- Loading / buffering: shown over the title's backdrop until the first frames play. -->
+            <Grid x:Name="LoadingPanel" Visibility="Collapsed">
+                <Grid.Background>
+                    <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                        <GradientStop Color="#33000000" Offset="0" />
+                        <GradientStop Color="#CC000000" Offset="1" />
+                    </LinearGradientBrush>
+                </Grid.Background>
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="1100">
+                    <ProgressRing IsActive="True" Width="72" Height="72" Foreground="#7B5BF5" Margin="0,0,0,24" />
+                    <TextBlock x:Name="LoadingTitle" FontSize="34" Foreground="White" HorizontalAlignment="Center" TextAlignment="Center" TextTrimming="CharacterEllipsis" />
+                    <TextBlock x:Name="LoadingText" FontSize="20" Foreground="#CCFFFFFF" Margin="0,10,0,0" HorizontalAlignment="Center" TextAlignment="Center" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Text="B  Back" FontSize="18" Foreground="#99FFFFFF" Margin="0,28,0,0" HorizontalAlignment="Center" />
                 </StackPanel>
             </Grid>
+
+            <!-- Paused / buffering indicator in the middle of the picture (with the bar). -->
+            <Grid x:Name="CenterIndicator" Visibility="Collapsed" Width="116" Height="116" HorizontalAlignment="Center" VerticalAlignment="Center" IsHitTestVisible="False">
+                <Ellipse Fill="#66000000" Stroke="#33FFFFFF" StrokeThickness="1" />
+                <TextBlock x:Name="CenterGlyph" FontFamily="Segoe MDL2 Assets" Text="&#xE769;" FontSize="42" Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                <ProgressRing x:Name="CenterRing" IsActive="False" Visibility="Collapsed" Width="60" Height="60" Foreground="White" />
+            </Grid>
+
+            <!-- On-screen bar; controller input is handled in code. -->
+            <Grid x:Name="Osd" VerticalAlignment="Bottom" Padding="72,140,72,44" Visibility="Collapsed" IsHitTestVisible="False">
+                <Grid.Background>
+                    <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                        <GradientStop Color="#00000000" Offset="0" />
+                        <GradientStop Color="#8C000000" Offset="0.45" />
+                        <GradientStop Color="#E6000000" Offset="1" />
+                    </LinearGradientBrush>
+                </Grid.Background>
+                <StackPanel>
+                    <TextBlock x:Name="OsdTitle" FontSize="34" FontWeight="SemiBold" Foreground="White" TextTrimming="CharacterEllipsis" />
+                    <TextBlock x:Name="OsdSubtitle" FontSize="20" Foreground="#CCFFFFFF" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" />
+                    <TextBlock x:Name="OsdInfo" FontSize="20" Foreground="#FFD54F" Margin="0,8,0,0" Visibility="Collapsed" TextTrimming="CharacterEllipsis" />
+                    <Grid Margin="0,22,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <!-- Seek bar: track, played part and a knob that grows while seeking. -->
+                        <Grid x:Name="OsdTrack" Height="26" VerticalAlignment="Center">
+                            <Border Height="4" CornerRadius="2" Background="#4DFFFFFF" VerticalAlignment="Center" />
+                            <Border x:Name="OsdFill" Width="0" Height="4" CornerRadius="2" Background="#7B5BF5" HorizontalAlignment="Left" VerticalAlignment="Center" />
+                            <Ellipse x:Name="OsdKnob" Width="16" Height="16" Fill="White" HorizontalAlignment="Left" VerticalAlignment="Center">
+                                <Ellipse.RenderTransform>
+                                    <TranslateTransform x:Name="OsdKnobShift" />
+                                </Ellipse.RenderTransform>
+                            </Ellipse>
+                        </Grid>
+                        <TextBlock x:Name="OsdRemaining" Grid.Column="1" FontSize="20" Foreground="White" Margin="24,0,0,0" VerticalAlignment="Center" />
+                    </Grid>
+                    <Grid Margin="0,10,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="OsdTime" FontSize="18" Foreground="#E6FFFFFF" />
+                        <TextBlock x:Name="OsdHints" Grid.Column="1" FontSize="16" Foreground="#8CFFFFFF" HorizontalAlignment="Right"
+                                   Margin="24,0,0,0" TextTrimming="CharacterEllipsis"
+                                   Text="A Play/Pause   ◀ ▶ Seek   LT RT Rewind / Forward   LB RB 10 s   Y X Audio &amp; Subtitles   B Back" />
+                    </Grid>
+                </StackPanel>
+            </Grid>
+
+            <!-- Audio & Subtitles: the picture dims and two columns appear, audio on the left, subtitles on the right. -->
+            <Grid x:Name="TrackMenu" Visibility="Collapsed" Background="#D9000000">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="1100" Margin="64,0">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Margin="0,0,24,0" MinWidth="420">
+                            <TextBlock x:Name="AudioHeader" Text="Audio" FontSize="30" FontWeight="SemiBold" Foreground="White" Margin="14,0,0,16" />
+                            <StackPanel x:Name="AudioItems" />
+                            <TextBlock x:Name="AudioPosition" FontSize="16" Foreground="#8CFFFFFF" HorizontalAlignment="Right" Margin="0,8,14,0" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Margin="24,0,0,0" MinWidth="420">
+                            <TextBlock x:Name="SubtitleHeader" Text="Subtitles" FontSize="30" FontWeight="SemiBold" Foreground="White" Margin="14,0,0,16" />
+                            <StackPanel x:Name="SubtitleItems" />
+                            <TextBlock x:Name="SubtitlePosition" FontSize="16" Foreground="#8CFFFFFF" HorizontalAlignment="Right" Margin="0,8,14,0" />
+                        </StackPanel>
+                    </Grid>
+                    <TextBlock Text="◀ ▶ Audio / Subtitles   ▲ ▼ Choose   A Select   B Close" FontSize="16" Foreground="#8CFFFFFF" HorizontalAlignment="Center" Margin="0,32,0,0" />
+                </StackPanel>
+            </Grid>
+
+            <!-- Skip intro (Stremio's intro timing for this video): low in the corner, lifted above the bar
+                 while the bar shows, see-through so the picture stays visible behind it. -->
+            <Border x:Name="SkipIntro" Visibility="Collapsed" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,72,72"
+                    Padding="16,11,24,11" CornerRadius="6" Background="#66000000" BorderBrush="#E6FFFFFF" BorderThickness="2">
+                <Border.RenderTransform>
+                    <TranslateTransform x:Name="SkipIntroShift" />
+                </Border.RenderTransform>
+                <StackPanel Orientation="Horizontal">
+                    <Border Width="28" Height="28" CornerRadius="14" Background="White" VerticalAlignment="Center" Margin="0,0,14,0">
+                        <TextBlock Text="A" FontSize="15" FontWeight="Bold" Foreground="Black" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <TextBlock Text="Skip Intro" FontSize="22" FontWeight="SemiBold" Foreground="White" VerticalAlignment="Center" />
+                    <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE893;" FontSize="16" Foreground="White" VerticalAlignment="Center" Margin="12,2,0,0" />
+                </StackPanel>
+            </Border>
+
+            <!-- Next episode card near the end (Stremio's "next video" popup), same corner and style. -->
+            <Border x:Name="UpNext" Visibility="Collapsed" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,72,72"
+                    MaxWidth="560" Padding="24,18" CornerRadius="8" Background="#99000000" BorderBrush="#59FFFFFF" BorderThickness="1">
+                <Border.RenderTransform>
+                    <TranslateTransform x:Name="UpNextShift" />
+                </Border.RenderTransform>
+                <StackPanel>
+                    <TextBlock Text="UP NEXT" FontSize="15" FontWeight="SemiBold" Foreground="#B39DFF" CharacterSpacing="200" />
+                    <TextBlock x:Name="UpNextTitle" FontSize="24" FontWeight="SemiBold" Foreground="White" TextTrimming="CharacterEllipsis" Margin="0,6,0,10" />
+                    <TextBlock x:Name="UpNextHint" FontSize="18" Foreground="#CCFFFFFF" />
+                </StackPanel>
+            </Border>
         </Grid>
+
+        <!-- Short messages (e.g. a stream that would not play). -->
+        <Border x:Name="Toast" Visibility="Collapsed" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,48,0,0"
+                MaxWidth="1100" Padding="24,16" CornerRadius="10" Background="#E6141218" BorderBrush="#E5534B" BorderThickness="2">
+            <TextBlock x:Name="ToastText" FontSize="20" Foreground="White" TextWrapping="Wrap" />
+        </Border>
 
         <Border
             x:Name="DebugPanel"

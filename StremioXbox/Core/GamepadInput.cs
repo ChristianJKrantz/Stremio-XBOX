@@ -20,6 +20,8 @@ namespace StremioXbox.Core
         LeftShoulder,
         RightShoulder,
         LeftStick, // Stick click: toggles the app's cursor.
+        LeftTrigger, // Triggers count as pressed past half way and repeat while held.
+        RightTrigger,
     }
 
     /// <summary>
@@ -29,6 +31,7 @@ namespace StremioXbox.Core
     public sealed class GamepadInput
     {
         private const double StickThreshold = 0.6;
+        private const double TriggerThreshold = 0.5;
         private static readonly TimeSpan RepeatDelay = TimeSpan.FromMilliseconds(400);
         private static readonly TimeSpan RepeatInterval = TimeSpan.FromMilliseconds(110);
 
@@ -56,9 +59,10 @@ namespace StremioXbox.Core
             _timer.Start();
         }
 
-        private static bool IsDirection(PadButton button)
+        // Buttons that repeat while held: the directions and the triggers (rewind / fast-forward).
+        private static bool Repeats(PadButton button)
         {
-            return button <= PadButton.Right;
+            return button <= PadButton.Right || button == PadButton.LeftTrigger || button == PadButton.RightTrigger;
         }
 
         private void Poll()
@@ -97,6 +101,8 @@ namespace StremioXbox.Core
             Set(PadButton.LeftShoulder, (buttons & GamepadButtons.LeftShoulder) != 0);
             Set(PadButton.RightShoulder, (buttons & GamepadButtons.RightShoulder) != 0);
             Set(PadButton.LeftStick, (buttons & GamepadButtons.LeftThumbstick) != 0);
+            Set(PadButton.LeftTrigger, reading.LeftTrigger > TriggerThreshold);
+            Set(PadButton.RightTrigger, reading.RightTrigger > TriggerThreshold);
 
             var now = DateTime.UtcNow;
             var newlyPressed = state & ~_previous;
@@ -109,7 +115,7 @@ namespace StremioXbox.Core
                     continue;
                 }
 
-                if (IsDirection(button))
+                if (Repeats(button))
                 {
                     _held = button;
                     _nextRepeat = now + RepeatDelay;

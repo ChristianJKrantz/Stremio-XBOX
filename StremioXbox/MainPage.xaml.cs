@@ -156,6 +156,7 @@ namespace StremioXbox
                 PositionCards();
             });
             Osd.SizeChanged += (sender, e) => PositionCards();
+            PlayerLayer.SizeChanged += (sender, e) => UpdateLetterbox();
         }
 
         private async void OnLoaded(object sender, RoutedEventArgs e)
@@ -902,7 +903,8 @@ namespace StremioXbox
             _preparing = false;
             _starting = true;
             _hasPlayed = false;
-            Player.Opacity = 1; // A playback closed during its restart seek leaves the picture hidden.
+            Curtain.Visibility = Visibility.Collapsed; // A playback closed during its restart seek leaves it up.
+            Letterbox.Visibility = Visibility.Collapsed;
             _reportedPaused = null;
             _upNextDismissed = false;
             _skipIntroDismissed = false;
@@ -939,6 +941,7 @@ namespace StremioXbox
             _mediaPlayer.PlaybackSession.BufferingStarted += OnBufferingStarted;
             _mediaPlayer.PlaybackSession.BufferingEnded += OnBufferingEnded;
             _mediaPlayer.PlaybackSession.PlaybackStateChanged += OnPlaybackStateChanged;
+            _mediaPlayer.PlaybackSession.NaturalVideoSizeChanged += OnNaturalVideoSizeChanged;
             SetUpRemoteCommands(_mediaPlayer);
 
             Player.SetMediaPlayer(_mediaPlayer);
@@ -947,6 +950,68 @@ namespace StremioXbox
             StartProgressTimer();
 
             _ = OpenSourceAsync(request, _mediaPlayer);
+        }
+
+        private void OnNaturalVideoSizeChanged(MediaPlaybackSession sender, object args)
+        {
+            _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+            {
+                if (_mediaPlayer?.PlaybackSession == sender)
+                {
+                    UpdateLetterbox();
+                }
+            });
+        }
+
+        // Paints the edges a Uniform-stretched picture leaves empty. The picture's shape comes from the decoded
+        // size and its pixel aspect ratio (anamorphic files show wider than they are stored). The bars are
+        // rounded down, so they never cover a line of the picture.
+        private void UpdateLetterbox()
+        {
+            try
+            {
+                var session = _mediaPlayer?.PlaybackSession;
+                double videoWidth = session?.NaturalVideoWidth ?? 0;
+                double videoHeight = session?.NaturalVideoHeight ?? 0;
+                if (_mediaPlayer?.Source is MediaPlaybackItem item && item.VideoTracks.Count > 0)
+                {
+                    var ratio = item.VideoTracks[0].GetEncodingProperties().PixelAspectRatio;
+                    if (ratio != null && ratio.Numerator > 0 && ratio.Denominator > 0)
+                    {
+                        videoWidth = videoWidth * ratio.Numerator / ratio.Denominator;
+                    }
+                }
+
+                var width = PlayerLayer.ActualWidth;
+                var height = PlayerLayer.ActualHeight;
+                if (videoWidth <= 0 || videoHeight <= 0 || width <= 0 || height <= 0)
+                {
+                    Letterbox.Visibility = Visibility.Collapsed;
+                    return;
+                }
+
+                var scale = Math.Min(width / videoWidth, height / videoHeight);
+                var top = Math.Max(0, Math.Floor((height - (videoHeight * scale)) / 2));
+                var side = Math.Max(0, Math.Floor((width - (videoWidth * scale)) / 2));
+                PlaceBar(BarTop, 0, 0, width, top);
+                PlaceBar(BarBottom, 0, height - top, width, top);
+                PlaceBar(BarLeft, 0, 0, side, height);
+                PlaceBar(BarRight, width - side, 0, side, height);
+                Letterbox.Visibility = top > 0 || side > 0 ? Visibility.Visible : Visibility.Collapsed;
+            }
+            catch (Exception ex)
+            {
+                Letterbox.Visibility = Visibility.Collapsed;
+                Log("warn", "Letterbox bars: " + ex.Message);
+            }
+        }
+
+        private static void PlaceBar(FrameworkElement bar, double left, double top, double width, double height)
+        {
+            Canvas.SetLeft(bar, left);
+            Canvas.SetTop(bar, top);
+            bar.Width = Math.Max(0, width);
+            bar.Height = Math.Max(0, height);
         }
 
         private void ShowPlayerLayer()
@@ -1820,6 +1885,9 @@ namespace StremioXbox
 
                 var video = DescribeMedia(sender, out var width, out var height, out var frameRate, out var transferFunction, out var subtype);
                 Log("info", video);
+                UpdateLetterbox();
+                Log("info", "Letterbox bars: " + (Letterbox.Visibility == Visibility.Visible
+                    ? string.Format("{0:0}px top/bottom, {1:0}px sides", BarTop.Height, BarLeft.Width) : "none"));
                 var reopened = _reopening; // Audio switch: same video, the display is already in the right mode.
 
                 if (!reopened)
@@ -1879,7 +1947,7 @@ namespace StremioXbox
                 {
                     var wasMuted = sender.IsMuted;
                     sender.IsMuted = true;
-                    Player.Opacity = 0;
+                    Curtain.Visibility = Visibility.Visible;
                     LoadingText.Text = "Almost ready";
                     try
                     {
@@ -1890,7 +1958,7 @@ namespace StremioXbox
                         if (sender == _mediaPlayer)
                         {
                             sender.IsMuted = wasMuted;
-                            Player.Opacity = 1;
+                            Curtain.Visibility = Visibility.Collapsed;
                         }
                     }
 
@@ -1983,6 +2051,7 @@ namespace StremioXbox
                 _mediaPlayer.PlaybackSession.BufferingStarted -= OnBufferingStarted;
                 _mediaPlayer.PlaybackSession.BufferingEnded -= OnBufferingEnded;
                 _mediaPlayer.PlaybackSession.PlaybackStateChanged -= OnPlaybackStateChanged;
+                _mediaPlayer.PlaybackSession.NaturalVideoSizeChanged -= OnNaturalVideoSizeChanged;
                 Player.SetMediaPlayer(null);
                 _mediaPlayer.Dispose();
                 _mediaPlayer = null;

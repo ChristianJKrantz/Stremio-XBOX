@@ -35,6 +35,18 @@
                 HorizontalAlignment="Stretch"
                 VerticalAlignment="Stretch" />
 
+            <!-- Black bars over the edges the picture leaves empty (wide films, 4:3 shows). On Xbox the video
+                 plane can keep old frames there instead of black, so they are painted over. Sized in code. -->
+            <Canvas x:Name="Letterbox" IsHitTestVisible="False" Visibility="Collapsed">
+                <Rectangle x:Name="BarTop" Fill="Black" />
+                <Rectangle x:Name="BarBottom" Fill="Black" />
+                <Rectangle x:Name="BarLeft" Fill="Black" />
+                <Rectangle x:Name="BarRight" Fill="Black" />
+            </Canvas>
+
+            <!-- Covers the picture during the startup restart seek (the video element itself stays as it is). -->
+            <Rectangle x:Name="Curtain" Fill="Black" IsHitTestVisible="False" Visibility="Collapsed" />
+
             <!-- Loading / buffering: shown over the title's backdrop until the first frames play. -->
             <Grid x:Name="LoadingPanel" Visibility="Collapsed">
                 <Grid.Background>

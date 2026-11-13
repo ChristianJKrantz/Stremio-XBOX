@@ -4,9 +4,13 @@
 #
 # Run it while the problem is on screen. Writes diagnostics\xbox-screen.png, diagnostics\xbox-session.log and
 # diagnostics\xbox-previous.log (the run before). Uses the same Device Portal login as Deploy-Xbox.ps1.
+#
+# -NoScreenshot fetches only the logs. Use it while a video plays: a 4K screenshot during HDR playback froze the
+# picture on a Series X until the player was restarted.
 param(
     [Parameter(Mandatory = $true)][string]$Xbox,
-    [int]$Port = 11443
+    [int]$Port = 11443,
+    [switch]$NoScreenshot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,12 +30,14 @@ function Save-Url([string]$path, [string]$file) {
 }
 
 # Screen first, while the problem is still showing.
-$shot = 0
-foreach ($path in @('/ext/screenshot?download=false', '/ext/screenshot', '/api/xbox/screenshot')) {
-    $shot = Save-Url $path 'xbox-screen.png'
-    if ($shot -eq 200) { Write-Host "Screen:       $out\xbox-screen.png"; break }
+if (-not $NoScreenshot) {
+    $shot = 0
+    foreach ($path in @('/ext/screenshot?download=false', '/ext/screenshot', '/api/xbox/screenshot')) {
+        $shot = Save-Url $path 'xbox-screen.png'
+        if ($shot -eq 200) { Write-Host "Screen:       $out\xbox-screen.png"; break }
+    }
+    if ($shot -ne 200) { Write-Warning "Screenshot not available from Device Portal (last answer $shot)." }
 }
-if ($shot -ne 200) { Write-Warning "Screenshot not available from Device Portal (last answer $shot)." }
 
 # The app's own log files, from its LocalState folder.
 $app = Find-StremioPackage $http 1

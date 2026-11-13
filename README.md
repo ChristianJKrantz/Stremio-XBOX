@@ -170,7 +170,7 @@ Fixes in this version that still need confirming on a console:
 | D-pad / Left stick | Move |
 | A | Select |
 | B | Back |
-| Menu (☰) on a poster | Options: play / resume, details, add to or remove from Library, mark as watched, remove from Continue Watching |
+| Menu (☰) on a poster | Options: play / resume, play from beginning (when there is saved progress), details, add to or remove from Library, mark as watched, remove from Continue Watching |
 | Left stick click | Cursor mode |
 | View | Debug log |
 

@@ -41,6 +41,11 @@
         }
     }
     var lastHandledStream = null;
+    // Where the viewer was before Stremio's player page, to return there when that page stays behind the
+    // native player (see leaveWebPlayer).
+    var lastPageHash = '#/';
+    var leftStream = null; // The stream whose player page leaveWebPlayer left, and when (a bounce back is ignored).
+    var leftAt = 0;
 
     // One source of controller input. Stremio Web has its own gamepad support (Settings > Gamepad support):
     // it polls navigator.getGamepads(), moves its own focus with the left stick and clicks with A. The app
@@ -799,6 +804,8 @@
     // or remove from the library, mark as watched, remove from Continue Watching. The actions are Stremio's
     // own (the same core calls its poster menus and detail page make), so the library stays in sync.
     var optionsReturn = null;
+    // "Play from Beginning": the video to start at 0:00 the next time it plays (once, for 2 minutes).
+    var startOver = null;
 
     function titleOf(element) {
         var link = element && (element.closest('a[href]') || element.querySelector('a[href]'));
@@ -875,8 +882,16 @@
             var poster = (item && item.poster) || (info.preview && info.preview.poster) || '';
             var choices = [];
             var resume = info.playLink || title.player;
+            var progress = item && item.state && item.state.timeOffset > 0 ? item.state.timeOffset : 0;
             if (resume) {
-                choices.push({ label: info.continueWatching ? 'Resume' : 'Play', run: function () { location.hash = resume.replace(/^#?/, '#'); } });
+                choices.push({ label: info.continueWatching || progress ? 'Resume' : 'Play', run: function () { location.hash = resume.replace(/^#?/, '#'); } });
+                if (progress) {
+                    choices.push({ label: 'Play from Beginning', run: function () {
+                        startOver = { videos: [item.state.video_id, title.videoId, title.id].filter(Boolean), until: Date.now() + 120000 };
+                        log('info', 'Play from Beginning: ' + startOver.videos.join(' / ') + ' (saved at ' + Math.round(progress / 1000) + ' s)');
+                        location.hash = resume.replace(/^#?/, '#');
+                    } });
+                }
             }
             choices.push({ label: 'Details', run: function () { location.hash = title.href.replace(/^#?/, '#'); } });
             if (inLibrary) {
@@ -1386,6 +1401,13 @@
         if (item && item.state && s.videoId && item.state.video_id === s.videoId && item.state.timeOffset > 0) {
             info.resumeMs = item.state.timeOffset;
         }
+        if (startOver && startOver.until > Date.now() && startOver.videos.indexOf(s.videoId) >= 0) {
+            log('info', 'Starting from the beginning (Play from Beginning) instead of ' + Math.round(info.resumeMs / 1000) + ' s');
+            info.resumeMs = 0;
+        }
+        if (startOver && (startOver.until <= Date.now() || startOver.videos.indexOf(s.videoId) >= 0)) {
+            startOver = null; // Used, or too old to mean this playback.
+        }
         info.next = describeNext(state.nextVideo);
         info.intro = describeIntro(state);
         return info;
@@ -1518,15 +1540,40 @@
         return true;
     };
 
+    // Stremio can put its player page in the history twice (starting from Continue Watching), so one step
+    // back lands on it again: its own player then loads behind the native one, fails ("Video is not
+    // supported") and keeps working in the background, and B after playback showed its empty player. Check
+    // once the step back has settled; if the page is still on this stream's player page, go back to where
+    // the viewer came from instead.
+    function leaveWebPlayer(stream, why) {
+        setTimeout(function () {
+            var still = /^#\/player\/([^/?]+)/.exec(location.hash);
+            if (!still || still[1] !== stream) {
+                return;
+            }
+            stopWebPlayer();
+            leftStream = stream;
+            leftAt = Date.now();
+            log('info', "Still on Stremio's player page after the step back (" + why + '); going to ' + lastPageHash);
+            location.replace(location.href.split('#')[0] + (lastPageHash.charAt(0) === '#' ? lastPageHash : '#' + lastPageHash));
+        }, 1200);
+    }
+
     function onRouteChanged() {
         post({ type: 'route', home: isHome() });
         restoreFocus(location.hash);
         var match = /^#\/player\/([^/?]+)/.exec(location.hash);
         if (!match) {
             lastHandledStream = null;
+            lastPageHash = location.hash || '#/';
             return;
         }
         if (match[1] === lastHandledStream) {
+            return;
+        }
+        if (match[1] === leftStream && Date.now() - leftAt < 10000) {
+            stopWebPlayer(); // Stremio sent the page back to a player page just left: never a second playback.
+            log('warn', "Stremio returned to the player page just left; ignoring it");
             return;
         }
         lastHandledStream = match[1];
@@ -1557,6 +1604,7 @@
             post({ type: 'preparing', session: s.id, name: stream.name || '' });
             // Leave the web player route so it does not keep loading the same file.
             history.back();
+            leaveWebPlayer(match[1], 'native playback started');
 
             function postPlay(subtitles, info, settings) {
                 if (s !== session) {

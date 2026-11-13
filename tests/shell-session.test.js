@@ -26,6 +26,10 @@ const location = {
         stack = stack.slice(0, idx + 1); stack.push(v); idx++;
         setTimeout(function () { fire('popstate'); fire('hashchange'); }, 0);
     },
+    replace: function (url) {
+        stack[idx] = hashOf(url);
+        setTimeout(function () { fire('popstate'); fire('hashchange'); }, 0);
+    },
     href: 'https://web.stremio.com/'
 };
 const history = {
@@ -212,6 +216,27 @@ async function openPlayer() {
     const play3 = await waitFor(function () { return postsOf('play')[0]; }, 12000) || {};
     check('F next episode plays', play3.url === 'https://cdn.example/Breaking.Bad.S01E02.mkv', play3);
     check('F first session saved and unloaded before the next Load', actions().filter(function (a) { return a !== 'Player.PausedChanged'; }).slice(0, 3).join() === 'Player.TimeChanged,Unload,Load', actions());
+
+    // I: Stremio put its player page in the history twice (Continue Watching): the one step back lands on
+    // it again, so the page goes back to where the viewer was, and that never starts a second playback.
+    posts = []; coreLog = [];
+    const encI = await encodeStream({ url: 'https://cdn.example/Breaking.Bad.S01E03.mkv', name: 'TB', behaviorHints: { filename: 'Breaking.Bad.S01E03.mkv' } });
+    const playerI = '#/player/' + encI + '/' + base + '/' + base + '/series/tt0903747/' + encodeURIComponent('tt0903747:1:3');
+    sandbox.history.pushState(null, '', '#/continue');
+    fire('popstate');
+    await sleep(50);
+    sandbox.history.pushState(null, '', playerI);
+    sandbox.history.pushState(null, '', playerI);
+    fire('popstate');
+    await waitFor(function () { return postsOf('play')[0]; }, 12000);
+    await sleep(1800);
+    check('I left a doubled player page for the page before it', location.hash === '#/continue', location.hash);
+    check('I one playback only', postsOf('play').length === 1, posts.map(function (p) { return p.type; }));
+    const playI = postsOf('play')[0];
+    if (playI) {
+        send({ type: 'player', event: 'stopped', session: playI.session, time: 1000, duration: 2000, paused: false });
+        await sleep(50);
+    }
 
     // G: one controller input. The page sees no gamepad, and connect events never reach Stremio.
     check('G page sees no gamepad', sandbox.navigator.getGamepads().length === 0, sandbox.navigator.getGamepads());

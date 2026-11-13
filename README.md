@@ -57,7 +57,7 @@ Passed through untouched to your soundbar or AVR.
 <td width="50%" valign="top">
 
 **🚀 Custom read buffer**<br>
-6 parallel connections and up to 768 MB of RAM read-ahead that follows the playhead. Built for remuxes that make other players choke.
+8 parallel connections (up to 12) and up to 768 MB of RAM read-ahead that follows the playhead. Built for remuxes that make other players choke.
 
 </td>
 </tr>
@@ -113,7 +113,7 @@ Windows' media player reads a network stream one request at a time, and on large
 jumping to a position far ahead of playback that the download can't keep up with. Every wait
 freezes the picture. Stremio-XBOX puts its own cache in between:
 
-- 6 parallel HTTP range connections in 4 MB chunks
+- 8 parallel HTTP range connections (up to 12 when the file needs it) in 1 MB chunks
 - up to 768 MB of read-ahead in RAM, anchored on where playback actually is
 - a quick seek right after playback starts that stops the player's far-ahead reads, which was the
   real cause of stutter on 80+ GB files
@@ -141,7 +141,8 @@ freezes the picture. Stremio-XBOX puts its own cache in between:
   country of production on Cinemeta, such as Japan or South Korea) plays in its original language with
   English subtitles when the file has that language, so you get the sub, not the dub. Within the language
   the best track wins: Atmos, then more channels, then Dolby Digital Plus, DTS, Dolby Digital, AAC.
-  Commentary and audio description are never picked first. A co-production listed under the wrong
+  Commentary and audio description are never picked first. Subtitles in the language already spoken (English
+  audio with English subtitles set in Stremio) stay off until you turn them on with X. A co-production listed under the wrong
   country can pick the other language; Y and X change it.
 - **Subtitles inside the video file can stutter 4K playback.** With one on, the Xbox player reads ahead
   through the file for the next line; on a track with lines only for some scenes it gets so far ahead that
@@ -149,7 +150,7 @@ freezes the picture. Stremio-XBOX puts its own cache in between:
   one inside the file only when no downloaded one in that language arrives. If a video stutters with
   subtitles on, pick a downloaded one with X.
 - **Big remuxes need a fast link.** Debrid servers give each connection only 5-8 Mbps, so the player starts
-  with 6 and adds more (up to 12) while the download is slower than the file's bitrate. A stream's average
+  with 8 and adds more (up to 12) while the download is slower than the file's bitrate. A stream's average
   bitrate is about its size in GB x 143 / runtime in minutes; well above your connection's speed, it buffers.
 - Built for direct / debrid links. Torrent streams need a streaming server.
 
@@ -187,6 +188,7 @@ freezes the picture. Stremio-XBOX puts its own cache in between:
 | ▲ / ▼ | Show the progress bar |
 | A on Skip intro | Skip the intro |
 | A on Up Next | Play the next episode |
+| X on the loading screen | Start from the beginning instead of resuming |
 | B | Close panel / hide card / stop |
 
 <sub>Same layout as the big console streaming apps. D-pad and trigger presses add up and apply once you stop, so one jump instead of many downloads. In the Audio & Subtitles panel ◀ ▶ switch columns.</sub>
@@ -224,6 +226,11 @@ Or from a terminal, once this PC trusts the console's Device Portal certificate 
   package with its dependencies and starts it (asks for the Device Portal login if one is set).
 - `powershell -ExecutionPolicy Bypass -File scripts\Get-XboxDiagnostics.ps1 -Xbox <ip>` saves a screenshot of the
   console and the app's log into `diagnostics\`, to capture a problem while it is on screen.
+- `powershell -ExecutionPolicy Bypass -File scripts\Save-XboxLogin.ps1 -Xbox <ip>` saves the Device Portal login
+  (encrypted by Windows, outside the repository), so the other scripts stop asking for it.
+- `powershell -ExecutionPolicy Bypass -File scripts\Xbox-Remote.ps1 -Xbox <ip> state | press down,a | navigate '#/library' | log`
+  drives the running app for testing: controller buttons, pages, what is on screen and the log. Only a Developer
+  Mode (sideloaded) install answers, on port 8765, with a key it hands over through the Device Portal login.
 
 Two checks run without Visual Studio or an Xbox:
 

@@ -55,12 +55,13 @@ namespace StremioXbox
         private double _lastDownload;
         private int _paceTicks;
         private readonly GamepadInput _gamepad = new GamepadInput();
+        private RemoteControl _remote;
         private DispatcherTimer _osdTimer;
         private DateTime _osdHideAt;
         private bool _cursorMode = ReadSetting("cursorMode", false);
         private bool _attachSubtitles = true; // LB in the debug log toggles it (stutter tests in 0.1.3.1).
         private HttpChunkCache _cache;
-        private int _connections = 6; // 0 = hand the URL to the player directly; RB in the debug log cycles it.
+        private int _connections = 8; // 0 = hand the URL to the player directly; RB in the debug log cycles it.
 
         // Restart seek modes (Menu in the debug log cycles them): seconds to jump forward before returning;
         // positive = after playback starts, negative = before playing (0.1.3.7), 0 = off.
@@ -137,6 +138,9 @@ namespace StremioXbox
         private int _subtitleGeneration;
         private volatile bool _audioDecided;  // The first audio choice is made (subtitles wait for it).
         private volatile bool _originalAudio; // A foreign title plays in its own language: English subtitles on.
+        private string _audioLanguage;        // The first audio choice's language ("en"; null when unknown).
+        private bool _startOverRequested;     // X on the loading screen: start at 0:00 instead of resuming.
+        private TaskCompletionSource<bool> _seekAbort; // Ends the wait of a running SeekAndWaitAsync early.
 
         // D-pad / shoulder seeking: presses add up to a target that is applied once they stop.
         private TimeSpan? _scrubTarget;
@@ -193,7 +197,177 @@ namespace StremioXbox
             Log("info", DisplayModeManager.DescribeDisplay());
             UpdateDebugHeader();
 
+            _remote = new RemoteControl(HandleRemoteAsync, LogAsync);
+            _ = _remote.StartAsync();
+
             await InitializeWebViewAsync();
+        }
+
+        // ---- Remote control (scripts\Xbox-Remote.ps1; Developer Mode installs only, see RemoteControl) ----
+
+        private static readonly Dictionary<string, PadButton> RemoteButtons = new Dictionary<string, PadButton>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["up"] = PadButton.Up, ["down"] = PadButton.Down, ["left"] = PadButton.Left, ["right"] = PadButton.Right,
+            ["a"] = PadButton.A, ["x"] = PadButton.X, ["y"] = PadButton.Y, ["view"] = PadButton.View, ["menu"] = PadButton.Menu,
+            ["start"] = PadButton.Menu, ["lb"] = PadButton.LeftShoulder, ["rb"] = PadButton.RightShoulder,
+            ["lt"] = PadButton.LeftTrigger, ["rt"] = PadButton.RightTrigger, ["ls"] = PadButton.LeftStick,
+        };
+
+        // Runs each request on the UI thread, as a controller press or a look at the screen would.
+        private Task<string> HandleRemoteAsync(RemoteRequest request)
+        {
+            var done = new TaskCompletionSource<string>();
+            _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, async () =>
+            {
+                try
+                {
+                    done.TrySetResult(await HandleRemoteOnUiAsync(request));
+                }
+                catch (Exception ex)
+                {
+                    done.TrySetResult("{\"error\":" + RemoteControl.Json(ex.Message) + "}");
+                }
+            });
+            return done.Task;
+        }
+
+        private async Task<string> HandleRemoteOnUiAsync(RemoteRequest request)
+        {
+            var path = request.Path.TrimEnd('/');
+            if (path == "/ping" || path == string.Empty)
+            {
+                var version = Package.Current.Id.Version;
+                return "{\"app\":\"Stremio-XBOX\",\"version\":\"" + version.Major + "." + version.Minor + "." + version.Build + "." + version.Revision + "\"}";
+            }
+
+            if (path.StartsWith("/press/", StringComparison.Ordinal))
+            {
+                var name = path.Substring("/press/".Length);
+                Log("info", "Remote: press " + name);
+                if (name == "b")
+                {
+                    var handled = HandleBack();
+                    return "{\"pressed\":\"b\",\"handled\":" + (handled ? "true" : "false") + "}";
+                }
+
+                if (!RemoteButtons.TryGetValue(name, out var button))
+                {
+                    return "{\"error\":" + RemoteControl.Json("unknown button: " + name) + "}";
+                }
+
+                OnPadButton(button);
+                return "{\"pressed\":" + RemoteControl.Json(name) + "}";
+            }
+
+            if (path == "/state")
+            {
+                return await RemoteStateAsync();
+            }
+
+            if (path == "/seek")
+            {
+                var session = _mediaPlayer?.PlaybackSession;
+                if (session == null || _starting || !double.TryParse(request.Get("to") ?? request.Body, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var seconds))
+                {
+                    return "{\"error\":\"needs a playing video and ?to=<seconds>\"}";
+                }
+
+                Log("info", "Remote: seek to " + FormatTime(TimeSpan.FromSeconds(seconds)));
+                var ok = await SeekAndWaitAsync(session, TimeSpan.FromSeconds(Math.Max(0, seconds)), true);
+                return "{\"seeked\":" + (ok ? "true" : "false") + ",\"position\":" + RemoteControl.Json(FormatTime(session.Position)) + "}";
+            }
+
+            if (path == "/log")
+            {
+                var count = int.TryParse(request.Get("lines"), out var n) ? Math.Max(1, Math.Min(n, _log.Count)) : Math.Min(100, _log.Count);
+                var lines = _log.Skip(Math.Max(0, _log.Count - count)).Select(RemoteControl.Json);
+                return "{\"lines\":[" + string.Join(",", lines) + "]}";
+            }
+
+            if (path == "/navigate" || path == "/eval")
+            {
+                if (_webView?.CoreWebView2 == null)
+                {
+                    return "{\"error\":\"the page is not ready\"}";
+                }
+
+                var script = path == "/navigate"
+                    ? "location.hash = " + RemoteControl.Json(request.Body.Trim().StartsWith("#") ? request.Body.Trim() : "#" + request.Body.Trim()) + "; location.hash"
+                    : request.Body;
+                Log("info", "Remote: " + path.Substring(1) + " " + (script.Length > 80 ? script.Substring(0, 80) + "..." : script).Replace("\n", " "));
+                var result = await _webView.CoreWebView2.ExecuteScriptAsync(script);
+                return "{\"result\":" + (string.IsNullOrEmpty(result) ? "null" : result) + "}";
+            }
+
+            return "{\"error\":\"unknown command; try /ping, /state, /press/<button>, /seek?to=<s>, /navigate, /eval, /log\"}";
+        }
+
+        private async Task<string> RemoteStateAsync()
+        {
+            var parts = new List<string>
+            {
+                "\"player\":" + (PlayerLayer.Visibility == Visibility.Visible ? "true" : "false"),
+                "\"loading\":" + (LoadingPanel.Visibility == Visibility.Visible
+                    ? "{\"title\":" + RemoteControl.Json(LoadingTitle.Text) + ",\"text\":" + RemoteControl.Json(LoadingText.Text) + ",\"keys\":" + RemoteControl.Json(LoadingKeys.Text) + "}"
+                    : "null"),
+                "\"tracksPanel\":" + (TrackMenu.Visibility == Visibility.Visible ? "true" : "false"),
+                "\"debugLog\":" + (DebugPanel.Visibility == Visibility.Visible ? "true" : "false"),
+                "\"toast\":" + (Toast.Visibility == Visibility.Visible ? RemoteControl.Json(ToastText.Text) : "null"),
+                "\"osdMessage\":" + RemoteControl.Json(_osdMessage),
+            };
+
+            var session = _mediaPlayer?.PlaybackSession;
+            if (session != null)
+            {
+                try
+                {
+                    var item = _mediaPlayer.Source as MediaPlaybackItem;
+                    string audio = null;
+                    string subtitle = null;
+                    if (item != null)
+                    {
+                        var audioIndex = item.AudioTracks.SelectedIndex;
+                        audio = audioIndex >= 0 && audioIndex < item.AudioTracks.Count ? DescribeAudio(item.AudioTracks[audioIndex]) : null;
+                        for (var i = 0; i < item.TimedMetadataTracks.Count; i++)
+                        {
+                            if (IsSubtitleTrack(item.TimedMetadataTracks[i]) &&
+                                item.TimedMetadataTracks.GetPresentationMode((uint)i) == TimedMetadataTrackPresentationMode.PlatformPresented)
+                            {
+                                subtitle = DescribeSubtitle(item.TimedMetadataTracks[i]);
+                                break;
+                            }
+                        }
+                    }
+
+                    parts.Add("\"playback\":{\"state\":" + RemoteControl.Json(session.PlaybackState.ToString()) +
+                        ",\"position\":" + RemoteControl.Json(FormatTime(session.Position)) +
+                        ",\"duration\":" + RemoteControl.Json(FormatTime(session.NaturalDuration)) +
+                        ",\"title\":" + RemoteControl.Json(_current?.DisplayTitle) +
+                        ",\"audio\":" + RemoteControl.Json(audio) +
+                        ",\"subtitles\":" + RemoteControl.Json(subtitle) + "}");
+                }
+                catch (Exception ex)
+                {
+                    parts.Add("\"playback\":{\"error\":" + RemoteControl.Json(ex.Message) + "}");
+                }
+            }
+
+            var page = "null";
+            if (_webView?.CoreWebView2 != null)
+            {
+                try
+                {
+                    var result = await _webView.CoreWebView2.ExecuteScriptAsync("window.__sxState ? window.__sxState() : null");
+                    page = string.IsNullOrEmpty(result) ? "null" : result;
+                }
+                catch (Exception ex)
+                {
+                    page = "{\"error\":" + RemoteControl.Json(ex.Message) + "}";
+                }
+            }
+
+            parts.Add("\"page\":" + page);
+            return "{" + string.Join(",", parts) + "}";
         }
 
         private async Task InitializeWebViewAsync()
@@ -934,6 +1108,7 @@ namespace StremioXbox
             _subtitleGeneration++;
             _audioDecided = false;
             _originalAudio = false;
+            _audioLanguage = null;
             _reopening = false;
             _reopenFallback = -1;
             _restoreSubtitle = null;
@@ -942,9 +1117,11 @@ namespace StremioXbox
             _binge = request.Binge;
             _nextLabel = string.IsNullOrEmpty(request.Next) ? null : request.Next;
             LoadingTitle.Text = request.DisplayTitle;
-            LoadingText.Text = request.StartPositionMs > 0
+            var resumes = request.StartPositionMs > 0 && !_startOverRequested;
+            LoadingText.Text = resumes
                 ? "Resuming from " + FormatTime(TimeSpan.FromMilliseconds(request.StartPositionMs))
-                : request.DisplaySubtitle;
+                : request.StartPositionMs > 0 ? "Starting from the beginning" : request.DisplaySubtitle;
+            LoadingKeys.Text = resumes ? "X  Start from the beginning        B  Back" : "B  Back";
             SetBackdrop(request.Background);
             if (request.HasRequestHeaders)
             {
@@ -1065,6 +1242,8 @@ namespace StremioXbox
             }
 
             _preparing = true;
+            _startOverRequested = false;
+            LoadingKeys.Text = "B  Back";
             _preparingSession = session;
             _preparingSince = DateTime.UtcNow;
             _current = null;
@@ -1445,10 +1624,37 @@ namespace StremioXbox
         {
             try
             {
+                // A server that refuses connections for a moment (seen with a TorBox CDN node) gets two more
+                // tries; when it stays unreachable, say so. Handing the player the URL then only failed later
+                // with "the Xbox can't play this format".
                 var probe = await HttpChunkCache.ResolveAsync(request.Url, LogAsync);
+                for (var attempt = 2; probe == null && attempt <= 3 && player == _mediaPlayer; attempt++)
+                {
+                    LoadingText.Text = "Connecting to the stream's server (try " + attempt + " of 3)";
+                    await Task.Delay(TimeSpan.FromSeconds(attempt == 2 ? 1.5 : 3));
+                    if (player != _mediaPlayer)
+                    {
+                        return;
+                    }
+
+                    probe = await HttpChunkCache.ResolveAsync(request.Url, LogAsync);
+                }
+
                 if (player != _mediaPlayer)
                 {
                     return; // Stopped while resolving.
+                }
+
+                if (probe == null && _connections > 0)
+                {
+                    Log("error", "The stream's server could not be reached (3 tries)");
+                    FailPlayback("Couldn't reach this stream's server. Try again in a moment, or pick another stream.");
+                    return;
+                }
+
+                if (request.StartPositionMs > 0 && !_startOverRequested)
+                {
+                    LoadingText.Text = "Resuming from " + FormatTime(TimeSpan.FromMilliseconds(request.StartPositionMs));
                 }
 
                 _fileSize = probe?.Size ?? 0;
@@ -1458,6 +1664,11 @@ namespace StremioXbox
                 {
                     var ahead = PickReadAheadBytes();
                     _cache = new HttpChunkCache(request.Url, probe.FinalUrl, probe.Size, _connections, ahead, LogAsync);
+                    if (request.StartPositionMs > 0)
+                    {
+                        _cache.HoldReadAhead(true); // Resuming further on: no read-ahead from the start (see ResumeAsync).
+                    }
+
                     _contentType = contentType;
                     _lastCacheBytes = 0;
                     source = MediaSource.CreateFromStream(new BufferedHttpStream(_cache, 0), contentType);
@@ -1571,6 +1782,9 @@ namespace StremioXbox
 
                     _audioNote = notes.Count == 0 ? null : string.Join("   ·   ", notes) + (MaybeSilent(chosen) ? string.Empty : "   ·   Y to change");
                     _originalAudio = decision.OriginalLanguage;
+                    _audioLanguage = string.IsNullOrEmpty(decision.Language) || decision.Language == "und"
+                        ? (AudioChoice.IsEnglishSpeaking(request.Country) ? "en" : null) // Untagged audio of an English-language title.
+                        : decision.Language;
                 }
 
                 var country = string.IsNullOrEmpty(request.Country) ? "unknown" : request.Country;
@@ -1808,6 +2022,22 @@ namespace StremioXbox
                 seconds, origin, forward && back ? "done" : "timed out", watch.ElapsedMilliseconds));
         }
 
+        // X on the loading screen: play from 0:00 instead of where Stremio's library left off. Before the resume
+        // seek, ResumeAsync skips it; after it (still loading), OnMediaOpened seeks back to the start.
+        private void RequestStartOver()
+        {
+            if (_startOverRequested || (_current != null && _current.StartPositionMs <= 0))
+            {
+                return; // Already asked, or nothing to resume.
+            }
+
+            _startOverRequested = true;
+            _seekAbort?.TrySetResult(false); // Stop waiting for the resume seek; OnMediaOpened goes to 0:00 next.
+            LoadingText.Text = "Starting from the beginning";
+            LoadingKeys.Text = "B  Back";
+            Log("info", "Start from the beginning (X on the loading screen)");
+        }
+
         // Where Stremio's library says this video was left; ignored when it is (almost) at the end.
         private async Task<TimeSpan> ResumeAsync(MediaPlayer player)
         {
@@ -1824,6 +2054,13 @@ namespace StremioXbox
             }
 
             var target = TimeSpan.FromMilliseconds(_current?.StartPositionMs ?? 0);
+            if (_startOverRequested && target > TimeSpan.Zero)
+            {
+                Log("info", "Starting from the beginning instead of resuming at " + FormatTime(target));
+                AddOsdNote("Started from the beginning");
+                return TimeSpan.Zero;
+            }
+
             var duration = session.NaturalDuration;
             if (target < TimeSpan.FromSeconds(5) || !session.CanSeek || (duration > TimeSpan.Zero && target > duration - TimeSpan.FromSeconds(60)))
             {
@@ -1877,21 +2114,64 @@ namespace StremioXbox
         private async Task<bool> SeekAndWaitAsync(MediaPlaybackSession session, TimeSpan target, bool stopOldDownloads = false)
         {
             var done = new TaskCompletionSource<bool>();
+            var abort = new TaskCompletionSource<bool>();
+            _seekAbort = abort;
             Windows.Foundation.TypedEventHandler<MediaPlaybackSession, object> handler = (s, e) => done.TrySetResult(true);
             session.SeekCompleted += handler;
             try
             {
                 _cache?.SeekStarted(stopOldDownloads);
                 session.Position = target;
-                return await Task.WhenAny(done.Task, Task.Delay(10000)) == done.Task;
+                return await Task.WhenAny(done.Task, Task.Delay(10000), abort.Task) == done.Task;
             }
             finally
             {
                 session.SeekCompleted -= handler;
+                if (_seekAbort == abort)
+                {
+                    _seekAbort = null;
+                }
             }
         }
 
-        // Holds playback until ~15 s of video is in RAM (or 15 s pass), so the first busy scenes have headroom.
+        // A paused player finishes the resume seek without reading the file there: it reads the new spot only
+        // once playing. Until then the read-ahead window sat at the start of the file, so the prebuffer below
+        // counted (and downloaded) the wrong part and playback began with nothing buffered. Playing muted
+        // behind the loading screen until the first read lands moves the window to the resume point.
+        private async Task WaitForResumeReadAsync(MediaPlayer player)
+        {
+            var cache = _cache;
+            if (cache == null)
+            {
+                return;
+            }
+
+            var before = cache.PlayheadChunk;
+            var wasMuted = player.IsMuted;
+            var watch = Stopwatch.StartNew();
+            player.IsMuted = true;
+            player.Play();
+            while (player == _mediaPlayer && watch.Elapsed < TimeSpan.FromSeconds(4) && cache.PlayheadChunk == before)
+            {
+                await Task.Delay(50);
+            }
+
+            if (player != _mediaPlayer)
+            {
+                return;
+            }
+
+            player.Pause();
+            player.IsMuted = wasMuted;
+            var moved = cache.PlayheadChunk != before;
+            Log(moved ? "info" : "warn", string.Format("Resume read {0} chunk {1} after {2} ms",
+                moved ? "reached" : "did not reach a new spot, still at", cache.PlayheadChunk, watch.ElapsedMilliseconds));
+        }
+
+        // Holds playback until enough video is in RAM for the first busy scenes (or 15 s pass). How much depends
+        // on the download against the file's bitrate, measured while waiting: well ahead (1.25x and more) the
+        // buffer only grows once playing, so 4 s is enough and the video starts in a few seconds; close to it,
+        // 8 s; slower, the full 15 s, which a remux on a slow link needs.
         private async Task PrebufferAsync(MediaPlayer player)
         {
             var cache = _cache;
@@ -1902,15 +2182,35 @@ namespace StremioXbox
             }
 
             var bytesPerSecond = cache.Size / duration;
-            var target = (long)Math.Min(cache.AheadBytes / 2, bytesPerSecond * 15);
+            var most = (long)Math.Min(cache.AheadBytes / 2, bytesPerSecond * 15);
             var watch = Stopwatch.StartNew();
-            while (cache.BufferedAheadBytes < target && watch.Elapsed < TimeSpan.FromSeconds(15) && player == _mediaPlayer)
+            var startBytes = cache.DownloadedBytes;
+            var ratio = 0.0;
+            while (player == _mediaPlayer && watch.Elapsed < TimeSpan.FromSeconds(15))
             {
+                var buffered = cache.BufferedAheadBytes;
+                if (buffered >= most)
+                {
+                    break;
+                }
+
+                if (watch.Elapsed > TimeSpan.FromSeconds(1.5))
+                {
+                    ratio = (cache.DownloadedBytes - startBytes) / watch.Elapsed.TotalSeconds / bytesPerSecond;
+                    var seconds = ratio >= 1.25 ? 4 : ratio >= 1.1 ? 8 : 15;
+                    if (buffered >= bytesPerSecond * seconds)
+                    {
+                        break;
+                    }
+                }
+
                 await Task.Delay(250);
             }
 
-            var buffered = cache.BufferedAheadBytes;
-            Log("info", string.Format("Prebuffered {0} MB ({1:0.0} s of video) in {2} ms", buffered >> 20, buffered / bytesPerSecond, watch.ElapsedMilliseconds));
+            var have = cache.BufferedAheadBytes;
+            Log("info", string.Format("Prebuffered {0} MB ({1:0.0} s of video) at chunk {2} in {3} ms{4}",
+                have >> 20, have / bytesPerSecond, cache.PlayheadChunk, watch.ElapsedMilliseconds,
+                ratio > 0 ? string.Format(", download {0:0.00}x the bitrate", ratio) : string.Empty));
         }
 
         private void OnMediaOpened(MediaPlayer sender, object args)
@@ -1964,9 +2264,29 @@ namespace StremioXbox
                 }
 
                 var origin = await ResumeAsync(sender);
+                if (origin > TimeSpan.Zero && !_startOverRequested)
+                {
+                    await WaitForResumeReadAsync(sender);
+                }
+
+                _cache?.HoldReadAhead(false);
                 if (sender != _mediaPlayer)
                 {
                     return;
+                }
+
+                if (_startOverRequested && origin > TimeSpan.Zero && !reopened)
+                {
+                    // X during the resume seek: straight to the start, before buffering around the old spot.
+                    var start = await SeekAndWaitAsync(sender.PlaybackSession, TimeSpan.Zero, true);
+                    if (sender != _mediaPlayer)
+                    {
+                        return;
+                    }
+
+                    Log(start ? "info" : "warn", "Started from the beginning instead of " + FormatTime(origin) + (start ? string.Empty : " (seek timed out)"));
+                    _osdMessage = "Started from the beginning";
+                    origin = TimeSpan.Zero;
                 }
 
                 var restartSeek = reopened ? 0 : RestartSeekModes[_restartSeekMode];
@@ -2013,6 +2333,20 @@ namespace StremioXbox
                     }
                 }
 
+                if (_startOverRequested && origin > TimeSpan.Zero && !reopened)
+                {
+                    // X came after the resume seek: go back to the start before the picture shows.
+                    var back = await SeekAndWaitAsync(sender.PlaybackSession, TimeSpan.Zero, true);
+                    if (sender != _mediaPlayer)
+                    {
+                        return;
+                    }
+
+                    Log(back ? "info" : "warn", "Started from the beginning after resuming at " + FormatTime(origin) + (back ? string.Empty : " (seek timed out)"));
+                    _osdMessage = "Started from the beginning"; // Replaces "Resumed from ...".
+                }
+
+                LoadingKeys.Text = "B  Back";
                 _starting = false;
                 _reopening = false;
                 _reopenFallback = -1;
@@ -2661,7 +2995,7 @@ namespace StremioXbox
                 }
                 else if (button == PadButton.RightShoulder)
                 {
-                    _connections = _connections == 0 ? 1 : _connections == 1 ? 2 : _connections == 2 ? 4 : _connections == 4 ? 6 : 0;
+                    _connections = _connections == 0 ? 1 : _connections == 1 ? 2 : _connections == 2 ? 4 : _connections == 4 ? 6 : _connections == 6 ? 8 : 0;
                     Log("info", "Download mode: " + DescribeConnections() + " (applies to the next playback)");
                     UpdateDebugHeader();
                 }
@@ -2756,7 +3090,12 @@ namespace StremioXbox
             var session = _mediaPlayer?.PlaybackSession;
             if (session == null || _starting)
             {
-                return; // Loading screen: only B (cancel) does anything.
+                if (button == PadButton.X && !_reopening)
+                {
+                    RequestStartOver();
+                }
+
+                return; // Loading screen: B cancels, X starts from the beginning instead of resuming.
             }
 
             if (TrackMenu.Visibility == Visibility.Visible)
@@ -3249,6 +3588,14 @@ namespace StremioXbox
             if (string.IsNullOrEmpty(language))
             {
                 _subtitleAutoDone = true;
+                return;
+            }
+
+            if (!_originalAudio && LanguageMatches(_audioLanguage, language))
+            {
+                // Subtitles in the language already spoken: off by default (X still turns them on).
+                _subtitleAutoDone = true;
+                Log("info", "Subtitles off by default: the audio is already " + LanguageName(language));
                 return;
             }
 

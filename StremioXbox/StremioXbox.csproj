@@ -66,6 +66,7 @@
     <Compile Include="Core\FileLog.cs" />
     <Compile Include="Core\GamepadInput.cs" />
     <Compile Include="Core\PlayRequest.cs" />
+    <Compile Include="Core\RemoteControl.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>

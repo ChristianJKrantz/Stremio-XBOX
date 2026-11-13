@@ -59,7 +59,7 @@
                     <ProgressRing IsActive="True" Width="72" Height="72" Foreground="#7B5BF5" Margin="0,0,0,24" />
                     <TextBlock x:Name="LoadingTitle" FontSize="34" Foreground="White" HorizontalAlignment="Center" TextAlignment="Center" TextTrimming="CharacterEllipsis" />
                     <TextBlock x:Name="LoadingText" FontSize="20" Foreground="#CCFFFFFF" Margin="0,10,0,0" HorizontalAlignment="Center" TextAlignment="Center" TextTrimming="CharacterEllipsis" />
-                    <TextBlock Text="B  Back" FontSize="18" Foreground="#99FFFFFF" Margin="0,28,0,0" HorizontalAlignment="Center" />
+                    <TextBlock x:Name="LoadingKeys" Text="B  Back" FontSize="18" Foreground="#99FFFFFF" Margin="0,28,0,0" HorizontalAlignment="Center" />
                 </StackPanel>
             </Grid>
 

@@ -30,10 +30,12 @@ namespace StremioXbox.Core
     /// </summary>
     public sealed class HttpChunkCache : IDisposable
     {
-        public const int ChunkSize = 4 * 1024 * 1024;
+        // 1 MB: debrid servers give each connection only 3-8 Mbps, so a 4 MB piece took 5-9 s and every seek (open,
+        // resume, scrub) waited that long for its first piece; 1 MB pieces arrive in about a second.
+        public const int ChunkSize = 1024 * 1024;
 
         // MKV keeps its seek index (cues) near the end; the header is in the first chunk. Both stay cached.
-        private const int PinnedTailChunks = 8;
+        private const int PinnedTailChunks = 32; // 32 MB: the MKV index (cues) the player reads at the end.
         private const int MaxAttempts = 4;
 
         // A connection that delivers nothing for this long is cut and the chunk retried.
@@ -64,6 +66,7 @@ namespace StremioXbox.Core
         private long _useCounter;
         private int _moveLogs;
         private bool _stopStale; // Set by SeekStarted(true); used up by the next read.
+        private volatile bool _holdReadAhead;
         private readonly Queue<KeyValuePair<int, long>> _recentReads = new Queue<KeyValuePair<int, long>>();
         private bool _disposed;
 
@@ -90,7 +93,7 @@ namespace StremioXbox.Core
             _log = log;
             _chunkCount = (size + ChunkSize - 1) / ChunkSize;
             _aheadChunks = Math.Max(2, aheadBytes / ChunkSize);
-            _behindChunks = 16; // 64 MB kept behind the playhead for short rewinds.
+            _behindChunks = 64; // 64 MB kept behind the playhead for short rewinds.
 
             var filter = new HttpBaseProtocolFilter();
             filter.CacheControl.ReadBehavior = HttpCacheReadBehavior.NoCache;
@@ -108,7 +111,20 @@ namespace StremioXbox.Core
             Task.Run(() => WorkerAsync(true));
         }
 
-        /// <summary>The most read-ahead connections AddConnections goes to (each holds one 4 MB chunk in flight).</summary>
+        /// <summary>
+        /// Sets whether read-ahead stays at the next few chunks: while the player opens a file it will resume
+        /// further on, reading ahead from the start only took connections from the resume position.
+        /// </summary>
+        public void HoldReadAhead(bool hold)
+        {
+            _holdReadAhead = hold;
+            if (!hold)
+            {
+                Wake();
+            }
+        }
+
+        /// <summary>The most read-ahead connections AddConnections goes to (each holds one chunk in flight).</summary>
         public const int MaxConnections = 12;
 
         public long Size { get; }
@@ -148,6 +164,9 @@ namespace StremioXbox.Core
         }
 
         public long AheadBytes { get; }
+
+        /// <summary>Gets the chunk the read-ahead window starts at (where the player last read).</summary>
+        public long PlayheadChunk => Interlocked.Read(ref _playheadChunk);
 
         /// <summary>Gets the total bytes received from the network.</summary>
         public long DownloadedBytes => Interlocked.Read(ref _downloadedBytes);
@@ -306,7 +325,10 @@ namespace StremioXbox.Core
                     var copied = CopyAvailableLocked(chunk, offset, destination, destinationOffset, count);
                     if (copied > 0)
                     {
-                        if (state != null && Interlocked.Increment(ref _waitLogs) <= LoggedWaits)
+                        // Waits of a few ms happen on every read inside the chunk still arriving: only the
+                        // ones long enough to matter are logged (the Views summary counts them all).
+                        if (state != null && (DateTime.UtcNow - started).TotalMilliseconds >= 50 &&
+                            Interlocked.Increment(ref _waitLogs) <= LoggedWaits)
                         {
                             _log("warn", string.Format(
                                 "Read waited {0:0} ms: view {6}, position {1} (chunk {2}, was {3}), playhead chunk {4}, served {5} KB",
@@ -331,7 +353,7 @@ namespace StremioXbox.Core
                 try
                 {
                     // Wake on the chunk finishing (or failing) or on more of it arriving: a read needs only
-                    // its own bytes, not the whole 4 MB, which after a seek is the difference between the
+                    // its own bytes, not the whole chunk, which after a seek is the difference between the
                     // first video frame and a frozen picture.
                     using (var linked = CancellationTokenSource.CreateLinkedTokenSource(token, _cts.Token))
                     {
@@ -605,7 +627,7 @@ namespace StremioXbox.Core
         // Chunks a read is waiting for, the pinned header/tail and the first chunks of the new window stay.
         private List<CancellationTokenSource> TakeStaleDownloadsLocked()
         {
-            var keepTo = _playheadChunk + Math.Max(4, _connections * 2);
+            var keepTo = _playheadChunk + Math.Max(16, _connections * 3);
             List<CancellationTokenSource> stale = null;
             List<Chunk> dropped = null;
             foreach (var chunk in _chunks.Values)
@@ -661,7 +683,7 @@ namespace StremioXbox.Core
         // the least recently used chunks outside the window go first.
         private void EvictLocked()
         {
-            var budget = _aheadChunks + _behindChunks + PinnedTailChunks + 1 + 32;
+            var budget = _aheadChunks + _behindChunks + PinnedTailChunks + 1 + 128;
             var held = 0;
             foreach (var chunk in _chunks.Values)
             {
@@ -730,7 +752,7 @@ namespace StremioXbox.Core
                 return best;
             }
 
-            var last = Math.Min(_chunkCount - 1, _playheadChunk + _aheadChunks);
+            var last = Math.Min(_chunkCount - 1, _playheadChunk + (_holdReadAhead ? 2 : _aheadChunks));
             for (var i = _playheadChunk; i <= last; i++)
             {
                 if (!_chunks.TryGetValue(i, out var chunk))
@@ -892,9 +914,9 @@ namespace StremioXbox.Core
                         chunk.Ready.TrySetResult(true);
                         progress.TrySetResult(true);
                         var elapsed = (DateTime.UtcNow - started).TotalMilliseconds;
-                        if (chunk.Index < 4 || elapsed > 4000)
+                        if (chunk.Index < 2 || elapsed > 3000)
                         {
-                            _log(elapsed > 4000 ? "warn" : "info", string.Format("Chunk {0}: {1} MB in {2:0} ms ({3:0} Mbps), attempt {4}", chunk.Index, length >> 20, elapsed, length * 8 / elapsed / 1000, attempt));
+                            _log(elapsed > 3000 ? "warn" : "info", string.Format("Chunk {0}: {1:0.0} MB in {2:0} ms ({3:0} Mbps), attempt {4}", chunk.Index, length / 1048576.0, elapsed, length * 8 / elapsed / 1000, attempt));
                         }
 
                         return;

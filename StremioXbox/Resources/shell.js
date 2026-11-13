@@ -40,6 +40,29 @@
             }
         }
     }
+    // Stremio's web player checks a stream with a HEAD request the moment its page opens, before the native
+    // player takes over. For a debrid link that is a second resolve of the same file (Torrentio, then the
+    // debrid service's API), on every play, against API limits. The native player makes its own request, so
+    // while it is on, a HEAD from the player page is never sent (the web player is stopped right after).
+    if (host && window.XMLHttpRequest) {
+        try {
+            var xhrOpen = XMLHttpRequest.prototype.open;
+            var xhrSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function (method, url) {
+                this.__sxSkip = nativePlayerEnabled && /^head$/i.test(String(method)) && /^https?:/i.test(String(url)) &&
+                    location.hash.indexOf('#/player/') === 0;
+                return xhrOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function () {
+                if (this.__sxSkip) {
+                    return undefined;
+                }
+                return xhrSend.apply(this, arguments);
+            };
+        } catch (e) {
+        }
+    }
+
     var lastHandledStream = null;
     // Where the viewer was before Stremio's player page, to return there when that page stays behind the
     // native player (see leaveWebPlayer).
@@ -315,6 +338,24 @@
     // Last highlighted element per route, so going back returns to the same tile instead of the top.
     var focusByRoute = {};
 
+    // Home is "", "#" or "#/" depending on how it was reached (app start, a link, the step back after playback).
+    function routeKey(hash) {
+        return !hash || hash === '#' || hash === '#/' ? '#/' : hash;
+    }
+
+    // For the app's remote control (testing): highlight the first item whose link or text contains the text.
+    window.__sxFocus = function (text) {
+        var found = Array.prototype.filter.call(document.querySelectorAll(FOCUSABLE), function (el) {
+            return isCandidate(el) && ((el.getAttribute('href') || '').indexOf(text) >= 0 || (el.textContent || '').indexOf(text) >= 0);
+        })[0];
+        if (!found) {
+            return 'not found: ' + text;
+        }
+        nativeNavigation = true;
+        setFocus(found, 'center');
+        return describeElement(found);
+    };
+
     function describeForRestore(element) {
         return {
             href: element.getAttribute('href') || '',
@@ -323,13 +364,21 @@
     }
 
     function restoreFocus(route) {
-        var saved = focusByRoute[route];
+        var saved = focusByRoute[routeKey(route)];
+        if (!saved && nativeNavigation && /^#\/detail\//.test(route)) {
+            focusFirstStream(route); // First visit: start on the first stream, as console apps do.
+            return;
+        }
+        if (!saved && nativeNavigation && routeKey(route) === '#/') {
+            focusFirstPoster(route); // Home opens on the first poster (Continue Watching), not the search bar.
+            return;
+        }
         if (!saved || !nativeNavigation) {
             return;
         }
         var tries = 0;
         (function attempt() {
-            if (location.hash !== route) {
+            if (routeKey(location.hash) !== routeKey(route)) {
                 return;
             }
             var found = null;
@@ -351,6 +400,42 @@
         })();
     }
 
+    // A title's page opens with nothing highlighted, so the first press went to the back arrow. Highlight the
+    // first stream that plays here (not the "Buy on ..." links), or the first episode, once Stremio lists them.
+    function focusFirstStream(route) {
+        var tries = 0;
+        (function attempt() {
+            if (location.hash !== route || (highlighted && highlighted.isConnected && document.contains(highlighted) && tries > 0)) {
+                return; // Moved on, or the viewer already moved the highlight.
+            }
+            var streams = Array.prototype.filter.call(document.querySelectorAll('a[class*="stream-container"], [class*="stream-container"] a, a[href^="#/player/"]'), function (el) {
+                return /^#\/player\//.test(el.getAttribute('href') || '') && isCandidate(el);
+            });
+            var episodes = streams.length ? [] : Array.prototype.filter.call(document.querySelectorAll('[class*="video-container"]'), isCandidate);
+            var first = streams[0] || episodes[0];
+            if (first) {
+                setFocus(first, 'nearest');
+            } else if (++tries < 25) {
+                setTimeout(attempt, 200); // Streams arrive from the addons a moment later.
+            }
+        })();
+    }
+
+    function focusFirstPoster(route) {
+        var tries = 0;
+        (function attempt() {
+            if (routeKey(location.hash) !== routeKey(route) || (highlighted && highlighted.isConnected && document.contains(highlighted))) {
+                return; // Moved on, or something is highlighted already.
+            }
+            var first = Array.prototype.filter.call(document.querySelectorAll('a[class*="meta-item"]'), isCandidate)[0];
+            if (first) {
+                setFocus(first, 'nearest');
+            } else if (++tries < 30) {
+                setTimeout(attempt, 200); // The board's rows load a moment later.
+            }
+        })();
+    }
+
     // vertical: an up/down move; the page glides so the new row sits at the same height on screen, as TV
     // apps do, rather than being left at the edge (where it sat half under Stremio's bottom banner).
     // block: jump straight there instead (restoring the highlight after going back).
@@ -368,7 +453,7 @@
 
     function markHighlight(element) {
         setShield(true);
-        focusByRoute[location.hash] = describeForRestore(element);
+        focusByRoute[routeKey(location.hash)] = describeForRestore(element);
         var previous = document.querySelector('.' + FOCUS_CLASS);
         if (previous) {
             previous.classList.remove(FOCUS_CLASS, FOCUS_CLASS + '-zoom');
@@ -690,9 +775,53 @@
                 best = el;
             }
         });
+        if (best && (direction === 'up' || direction === 'down')) {
+            best = closerRow(fromRect, best, candidates, direction, from) || best;
+        }
         if (best) {
             setFocus(best, null, direction === 'up' || direction === 'down');
         }
+    }
+
+    // TV rows: up / down goes to the next row of posters even when it is short and sits off to one side (a
+    // Continue Watching row of 3 under the search bar at the right). The plain score skipped it for a row
+    // further away that happened to have a poster underneath. Only posters count, so the side menu and
+    // buttons keep the plain behaviour.
+    function closerRow(fromRect, best, candidates, direction, from) {
+        var bestRect = best.getBoundingClientRect();
+        var down = direction === 'down';
+        var row = [];
+        candidates.forEach(function (el) {
+            if (el === from || el === best || from.contains(el) || el.contains(from) || !isPoster(el)) {
+                return;
+            }
+            var r = el.getBoundingClientRect();
+            var middle = r.top + r.height / 2;
+            var ahead = down ? r.top >= fromRect.bottom - 1 && middle < bestRect.top : r.bottom <= fromRect.top + 1 && middle > bestRect.bottom;
+            if (ahead) {
+                row.push({ el: el, r: r, gap: down ? r.top - fromRect.bottom : fromRect.top - r.bottom });
+            }
+        });
+        if (row.length === 0) {
+            return null;
+        }
+        var nearestGap = Math.min.apply(null, row.map(function (c) { return c.gap; }));
+        var fx = fromRect.left + fromRect.width / 2;
+        var pick = null;
+        row.forEach(function (c) {
+            if (c.gap > nearestGap + c.r.height / 2) {
+                return; // A row further on.
+            }
+            var dx = Math.abs(c.r.left + c.r.width / 2 - fx);
+            if (!pick || dx < pick.dx) {
+                pick = { el: c.el, dx: dx };
+            }
+        });
+        return pick ? pick.el : null;
+    }
+
+    function isPoster(element) {
+        return /meta-item/.test(String(element.className)) || !!(element.closest && element.closest('[class*="meta-item"]'));
     }
 
     // Stremio's web player: Space (keydown + keyup) toggles play/pause, arrows seek.
@@ -778,6 +907,9 @@
                 if (/^#\/settings/.test(location.hash)) {
                     log('info', 'Settings activate: ' + describeElement(from));
                 }
+                if (resumeFromContinueWatching(from)) {
+                    return;
+                }
                 var dropdown = openOverlay();
                 var toggle = dropdown && dropdown.kind === 'dropdown' && dropdown.root.contains(from) ? dropdownToggle(dropdown.root) : null;
                 from.click();
@@ -797,6 +929,34 @@
             return; // Let the caret move inside text fields.
         }
         move(action);
+    }
+
+    // A on a Continue Watching poster resumes it, as console streaming apps do, with the stream Stremio kept
+    // for it (its own "player" link); the loading screen offers X to start from the beginning instead. Its
+    // poster link only opened the episode's stream list. Without a kept stream, the link opens as before.
+    function inContinueWatching(element) {
+        if (/^#\/continue-watching/.test(location.hash)) {
+            return isPoster(element);
+        }
+        var row = isPoster(element) && element.closest('[class*="board-row"], [class*="meta-row"]');
+        var heading = row && row.querySelector('[class*="title"], [class*="header"]');
+        return !!heading && /continue watching/i.test(heading.textContent || '');
+    }
+
+    function resumeFromContinueWatching(from) {
+        var title = inContinueWatching(from) ? titleOf(from) : null;
+        if (!title) {
+            return false;
+        }
+        lookUpTitle(title.id).then(function (info) {
+            if (info.playLink) {
+                log('info', 'Continue Watching: resuming "' + ((info.libraryItem && info.libraryItem.name) || title.id) + '" with its last stream');
+                location.hash = info.playLink.replace(/^#?/, '#');
+            } else if (from.isConnected) {
+                from.click();
+            }
+        });
+        return true;
     }
 
     // ---- Title options (Menu button) ---------------------------------------------------------------------
@@ -828,7 +988,11 @@
         return Promise.all(models.map(function (model) {
             return coreCall(function (core) { return core.getState(model); }, null);
         })).then(function (states) {
-            var found = { libraryItem: null, preview: null, continueWatching: false, playLink: null };
+            // Library entries come in three shapes: a full one (meta_details: state with timeOffset, video_id),
+            // a Continue Watching one (progress in percent, state with only videoId) and the Library page's
+            // summary (progress, watched, no state). Gather what each tells, preferring the full entry.
+            var found = { libraryItem: null, preview: null, continueWatching: false, playLink: null, full: null, entry: null,
+                progress: 0, watched: null, videoId: null };
             states.forEach(function (state, index) {
                 (function walk(value, depth) {
                     if (!value || typeof value !== 'object' || depth > 7) {
@@ -838,10 +1002,23 @@
                         value.forEach(function (v) { walk(v, depth + 1); });
                         return;
                     }
-                    if (value._id === id && value.state) {
-                        found.libraryItem = found.libraryItem || value;
+                    if (value._id === id && (value.state || index <= 2)) {
+                        found.entry = found.entry || value;
+                        if (value.state && typeof value.state.timeOffset === 'number') {
+                            found.full = found.full || value;
+                        }
                         if (index <= 1) {
                             found.continueWatching = true;
+                        }
+                        if (typeof value.progress === 'number' && value.progress > found.progress) {
+                            found.progress = value.progress;
+                        }
+                        if (typeof value.watched === 'boolean') {
+                            found.watched = value.watched;
+                        }
+                        var video = value.state && (value.state.video_id || value.state.videoId);
+                        if (video && !found.videoId) {
+                            found.videoId = video;
                         }
                         if (!found.playLink && value.deepLinks && typeof value.deepLinks.player === 'string') {
                             found.playLink = value.deepLinks.player;
@@ -856,6 +1033,22 @@
                     }
                 })(state, 0);
             });
+            var entry = found.full || found.entry;
+            if (entry) {
+                var full = found.full && found.full.state;
+                found.libraryItem = {
+                    _id: entry._id, type: entry.type, name: entry.name, poster: entry.poster,
+                    removed: !!entry.removed, temp: !!entry.temp,
+                    state: {
+                        timeOffset: full ? full.timeOffset : 0,
+                        video_id: (full && full.video_id) || found.videoId,
+                        timesWatched: full ? full.timesWatched : (found.watched ? 1 : 0),
+                        flaggedWatched: full ? full.flaggedWatched : (found.watched ? 1 : 0)
+                    }
+                };
+                // Saved progress, from any shape: a resume time, or a percentage (Continue Watching, Library).
+                found.hasProgress = (full && full.timeOffset > 0) || found.progress > 0;
+            }
             return found;
         });
     }
@@ -882,13 +1075,14 @@
             var poster = (item && item.poster) || (info.preview && info.preview.poster) || '';
             var choices = [];
             var resume = info.playLink || title.player;
-            var progress = item && item.state && item.state.timeOffset > 0 ? item.state.timeOffset : 0;
+            var progress = info.hasProgress ? (item.state.timeOffset || 0) : 0;
+            var hasProgress = !!info.hasProgress;
             if (resume) {
-                choices.push({ label: info.continueWatching || progress ? 'Resume' : 'Play', run: function () { location.hash = resume.replace(/^#?/, '#'); } });
-                if (progress) {
+                choices.push({ label: info.continueWatching || hasProgress ? 'Resume' : 'Play', run: function () { location.hash = resume.replace(/^#?/, '#'); } });
+                if (hasProgress) {
                     choices.push({ label: 'Play from Beginning', run: function () {
                         startOver = { videos: [item.state.video_id, title.videoId, title.id].filter(Boolean), until: Date.now() + 120000 };
-                        log('info', 'Play from Beginning: ' + startOver.videos.join(' / ') + ' (saved at ' + Math.round(progress / 1000) + ' s)');
+                        log('info', 'Play from Beginning: ' + startOver.videos.join(' / ') + (progress ? ' (saved at ' + Math.round(progress / 1000) + ' s)' : ''));
                         location.hash = resume.replace(/^#?/, '#');
                     } });
                 }
@@ -1494,8 +1688,32 @@
     }
 
     // Events from the native player: {type:'player', event, session, time, duration, paused}.
+    // After the native player closes, Stremio redraws the row the video came from (new progress, new order),
+    // dropping the highlighted poster with it: nothing was highlighted until a press. Put it back on the same
+    // title once the row has settled.
+    function rehighlight() {
+        if (!nativeNavigation || document.getElementById('__sx-menu') || /^#\/player\//.test(location.hash)) {
+            return;
+        }
+        if (highlighted && highlighted.isConnected && isCandidate(highlighted)) {
+            if (!highlighted.classList.contains(FOCUS_CLASS)) {
+                markHighlight(highlighted);
+            }
+            return;
+        }
+        restoreFocus(location.hash);
+    }
+
+    function rehighlightSoon() {
+        setTimeout(rehighlight, 700);
+        setTimeout(rehighlight, 2000);
+    }
+
     function onNativePlayer(message) {
         var s = session && session.id === message.session ? session : null;
+        if (/^(stopped|cancel|failed|ended)$/.test(message.event)) {
+            rehighlightSoon();
+        }
         switch (message.event) {
             case 'progress':
                 if (s) { reportTime(s, message); }
@@ -1525,6 +1743,25 @@
     function isHome() {
         return location.hash === '' || location.hash === '#' || location.hash === '#/';
     }
+    // What is on the page, for the app's remote control (scripts\Xbox-Remote.ps1 state).
+    window.__sxState = function () {
+        var menu = document.getElementById('__sx-menu');
+        var focused = current();
+        var items = menu ? Array.prototype.slice.call(menu.querySelectorAll('.__sx-menu-item')) : [];
+        var toast = document.querySelector('.__sx-toast');
+        return {
+            route: location.hash,
+            focused: describeElement(focused),
+            title: titleOf(focused),
+            menu: menu ? {
+                title: ((menu.querySelector('.__sx-menu-title') || {}).textContent || ''),
+                items: items.map(function (item) { return item.textContent; }),
+                focused: items.indexOf(focused)
+            } : null,
+            toast: toast ? toast.textContent : null
+        };
+    };
+
     window.__sxBack = function () {
         if (Date.now() - lastBack > 500 && closeOverlay()) {
             lastBack = Date.now();

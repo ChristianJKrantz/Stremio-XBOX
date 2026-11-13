@@ -145,18 +145,6 @@ freezes the picture. Stremio-XBOX puts its own cache in between:
   country can pick the other language; Y and X change it.
 - Built for direct / debrid links. Torrent streams need a streaming server.
 
-## 🚧 Work in progress (WIP)
-
-Fixes in this version that still need confirming on a console:
-
-- **Switching audio formats** (e.g. E-AC3 → AC3) used to crash the player. Now a switch to another
-  format reloads the video from the RAM buffer with the new track and returns to the same spot (a short
-  loading screen), and goes back to the old track if the new one fails. Same-format switches stay instant.
-- **Seeking far past the buffer** used to freeze for 5–20 s. Now the picture resumes as soon as its own
-  bytes arrive instead of a whole 4 MB chunk, and downloads for the old position stop so every connection
-  starts on the new one. In a simulated debrid server (5 MB/s per connection, 3 s first byte) the first
-  data after a far seek came 0.8 s sooner. What's left is mostly the server starting the new range.
-
 ## 🎮 Controls
 
 <table>

@@ -302,6 +302,22 @@ namespace StremioXbox
             return "{\"error\":\"unknown command; try /ping, /state, /press/<button>, /seek?to=<s>, /navigate, /eval, /log\"}";
         }
 
+        // The Audio & Subtitles panel as the viewer sees it: each column's items, the highlighted one (">")
+        // and the one playing ("*").
+        private string RemoteTrackMenu()
+        {
+            var columns = new List<string>();
+            for (var column = 0; column < _menuColumns.Length; column++)
+            {
+                var entries = _menuColumns[column] ?? new List<MenuEntry>();
+                var items = entries.Select((entry, i) => RemoteControl.Json(
+                    (column == _menuColumn && i == _menuIndexes[column] ? "> " : "  ") + (entry.Selected ? "* " : "  ") + entry.Label));
+                columns.Add("[" + string.Join(",", items) + "]");
+            }
+
+            return "{\"audio\":" + columns[AudioColumn] + ",\"subtitles\":" + columns[SubtitleColumn] + "}";
+        }
+
         private async Task<string> RemoteStateAsync()
         {
             var parts = new List<string>
@@ -311,6 +327,7 @@ namespace StremioXbox
                     ? "{\"title\":" + RemoteControl.Json(LoadingTitle.Text) + ",\"text\":" + RemoteControl.Json(LoadingText.Text) + ",\"keys\":" + RemoteControl.Json(LoadingKeys.Text) + "}"
                     : "null"),
                 "\"tracksPanel\":" + (TrackMenu.Visibility == Visibility.Visible ? "true" : "false"),
+                "\"tracks\":" + (TrackMenu.Visibility == Visibility.Visible ? RemoteTrackMenu() : "null"),
                 "\"debugLog\":" + (DebugPanel.Visibility == Visibility.Visible ? "true" : "false"),
                 "\"toast\":" + (Toast.Visibility == Visibility.Visible ? RemoteControl.Json(ToastText.Text) : "null"),
                 "\"osdMessage\":" + RemoteControl.Json(_osdMessage),
@@ -452,6 +469,26 @@ namespace StremioXbox
             core.WebResourceRequested += (sender, args) =>
             {
                 var uri = args.Request.Uri;
+
+                // Stremio checks a stream with a HEAD request (from its worker, so shell.js cannot stop it)
+                // as its player page opens. For a debrid link that resolves the file a second time, against
+                // the service's API limits, on every play; the native player makes its own request. Answered
+                // here without going to the network.
+                if (_nativePlayerEnabled && string.Equals(args.Request.Method, "HEAD", StringComparison.OrdinalIgnoreCase) &&
+                    (_preparing || (sender.Source ?? string.Empty).Contains("#/player/")))
+                {
+                    try
+                    {
+                        args.Response = sender.Environment.CreateWebResourceResponse(null, 200, "OK", "Content-Type: application/octet-stream");
+                        LogRequest("info", "Answered the web player's stream check without the network: HEAD " + DescribeUri(uri));
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("warn", "Could not answer the web player's stream check: " + ex.Message);
+                    }
+                }
+
                 if (!IsLoggedRequest(uri, args.ResourceContext))
                 {
                     return;
@@ -1243,6 +1280,11 @@ namespace StremioXbox
 
             _preparing = true;
             _startOverRequested = false;
+            lock (_subtitleFiles)
+            {
+                _subtitleFiles.Clear(); // Kept only for one title's audio switches.
+            }
+
             LoadingKeys.Text = "B  Back";
             _preparingSession = session;
             _preparingSince = DateTime.UtcNow;
@@ -2147,12 +2189,26 @@ namespace StremioXbox
             }
 
             var before = cache.PlayheadChunk;
+            var reads = cache.ReadCount;
             var wasMuted = player.IsMuted;
             var watch = Stopwatch.StartNew();
+            TimeSpan? firstRead = null;
             player.IsMuted = true;
             player.Play();
+            // Until the window jumps, or reads have run half a second without moving it (a resume point
+            // close to the start is already in the window).
             while (player == _mediaPlayer && watch.Elapsed < TimeSpan.FromSeconds(4) && cache.PlayheadChunk == before)
             {
+                if (firstRead == null && cache.ReadCount != reads)
+                {
+                    firstRead = watch.Elapsed;
+                }
+
+                if (firstRead != null && watch.Elapsed - firstRead.Value > TimeSpan.FromMilliseconds(500))
+                {
+                    break;
+                }
+
                 await Task.Delay(50);
             }
 
@@ -2164,8 +2220,8 @@ namespace StremioXbox
             player.Pause();
             player.IsMuted = wasMuted;
             var moved = cache.PlayheadChunk != before;
-            Log(moved ? "info" : "warn", string.Format("Resume read {0} chunk {1} after {2} ms",
-                moved ? "reached" : "did not reach a new spot, still at", cache.PlayheadChunk, watch.ElapsedMilliseconds));
+            Log(moved || firstRead != null ? "info" : "warn", string.Format("Resume read {0} chunk {1} after {2} ms",
+                moved ? "reached" : firstRead != null ? "stayed at" : "never came; still at", cache.PlayheadChunk, watch.ElapsedMilliseconds));
         }
 
         // Holds playback until enough video is in RAM for the first busy scenes (or 15 s pass). How much depends
@@ -2381,7 +2437,14 @@ namespace StremioXbox
 
                 LogPlaybackStatus("at failure");
                 Log("error", "Native player failed: " + args.Error + code + " " + args.ErrorMessage);
-                var reason = args.Error == MediaPlayerError.NetworkError ? "the server stopped responding"
+                // A download that failed outright makes the player report a decoding error: say what happened.
+                var network = _cache?.NetworkFailure != null;
+                if (network)
+                {
+                    Log("info", "The failure follows a download failure: " + _cache.NetworkFailure);
+                }
+
+                var reason = network || args.Error == MediaPlayerError.NetworkError ? "its server stopped responding (try again later, or pick another stream)"
                     : args.Error == MediaPlayerError.SourceNotSupported ? "the Xbox can't play this format"
                     : args.Error == MediaPlayerError.DecodingError ? "the video couldn't be decoded"
                     : "playback failed" + code;
@@ -2390,7 +2453,7 @@ namespace StremioXbox
                     PostPlayerEvent("progress", true); // Keep the position for a retry with another stream.
                 }
 
-                FailPlayback("Couldn't play this stream: " + reason + ". Pick another stream to keep watching.");
+                FailPlayback("Couldn't play this stream: " + reason + (network ? "." : ". Pick another stream to keep watching."));
             });
         }
 
@@ -2436,6 +2499,7 @@ namespace StremioXbox
                 _mediaPlayer = null;
             }
 
+            Interlocked.Increment(ref _subtitleLoads); // Subtitle downloads for this source stop.
             _starting = false;
             _reopening = false;
             _hasPlayed = false;
@@ -3773,17 +3837,183 @@ namespace StremioXbox
             return (untagged ? string.Empty : LanguageName(track.Language) + "  ·  ") + format + " " + channels + label;
         }
 
+        // Subtitle servers limit how many files one address fetches at once: OpenSubtitles' subs5.strem.io
+        // answers 429 to most of 20 parallel requests, so with every file handed to the player at the same
+        // moment all 11 English ones of a film failed. They are downloaded here two at a time, in the page's
+        // order (the viewer's language first), retried when the server asks to slow down, and kept for the
+        // session so an audio switch (which rebuilds the source) does not fetch them again.
+        private static readonly Windows.Web.Http.HttpClient SubtitleClient = new Windows.Web.Http.HttpClient();
+        private readonly Dictionary<string, byte[]> _subtitleFiles = new Dictionary<string, byte[]>();
+        private int _subtitleLoads;
+
         private void AddExternalSubtitles(MediaSource source, PlayRequest request)
         {
             _externalSubtitleLanguages.Clear();
             _externalSubtitlesPending = 0;
+            var generation = ++_subtitleLoads;
+            var queue = new List<KeyValuePair<SubtitleSource, Uri>>();
             foreach (var subtitle in request.Subtitles)
+            {
+                if (!Uri.TryCreate(subtitle.Url, UriKind.Absolute, out var uri))
+                {
+                    Log("warn", "Subtitle skipped (" + subtitle.Label + "): not a link");
+                    continue;
+                }
+
+                var label = string.IsNullOrEmpty(subtitle.Label) ? subtitle.Language : subtitle.Label;
+                if (!_externalSubtitleLanguages.ContainsKey(label))
+                {
+                    _externalSubtitleLanguages[label] = subtitle.Language;
+                }
+
+                _externalSubtitlesPending++;
+                queue.Add(new KeyValuePair<SubtitleSource, Uri>(subtitle, uri));
+            }
+
+            Log("info", "External subtitles: " + request.Subtitles.Count);
+            var next = 0;
+            for (var worker = 0; worker < 2; worker++)
+            {
+                _ = Task.Run(async () =>
+                {
+                    while (true)
+                    {
+                        var index = Interlocked.Increment(ref next) - 1;
+                        if (index >= queue.Count || generation != Volatile.Read(ref _subtitleLoads))
+                        {
+                            return;
+                        }
+
+                        var entry = queue[index];
+                        var data = await DownloadSubtitleAsync(entry.Value, generation);
+                        var attached = new TaskCompletionSource<bool>();
+                        await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, async () =>
+                        {
+                            try
+                            {
+                                await AttachSubtitleAsync(source, entry.Key, data, generation);
+                            }
+                            finally
+                            {
+                                attached.TrySetResult(true);
+                            }
+                        });
+                        await attached.Task;
+                    }
+                });
+            }
+        }
+
+        private async Task<byte[]> DownloadSubtitleAsync(Uri uri, int generation)
+        {
+            lock (_subtitleFiles)
+            {
+                if (_subtitleFiles.TryGetValue(uri.AbsoluteUri, out var cached))
+                {
+                    return cached;
+                }
+            }
+
+            for (var attempt = 1; attempt <= 4 && generation == Volatile.Read(ref _subtitleLoads); attempt++)
             {
                 try
                 {
-                    var label = string.IsNullOrEmpty(subtitle.Label) ? subtitle.Language : subtitle.Label;
-                    var language = subtitle.Language;
-                    var timedText = TimedTextSource.CreateFromUri(new Uri(subtitle.Url));
+                    using (var response = await SubtitleClient.GetAsync(uri).AsTask(new CancellationTokenSource(TimeSpan.FromSeconds(15)).Token))
+                    {
+                        var status = (int)response.StatusCode;
+                        if (response.IsSuccessStatusCode)
+                        {
+                            var buffer = await response.Content.ReadAsBufferAsync();
+                            var bytes = new byte[buffer.Length];
+                            Windows.Storage.Streams.DataReader.FromBuffer(buffer).ReadBytes(bytes);
+                            lock (_subtitleFiles)
+                            {
+                                _subtitleFiles[uri.AbsoluteUri] = bytes;
+                            }
+
+                            return bytes;
+                        }
+
+                        if (status != 429 && status < 500)
+                        {
+                            Log("warn", "Subtitle download " + status + ": " + uri.Host);
+                            return null;
+                        }
+
+                        var wait = response.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(attempt * 1.5);
+                        await Task.Delay(wait < TimeSpan.FromSeconds(10) ? wait : TimeSpan.FromSeconds(10));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (attempt == 4)
+                    {
+                        Log("warn", "Subtitle download failed: " + uri.Host + " " + ex.Message);
+                        return null;
+                    }
+
+                    await Task.Delay(TimeSpan.FromSeconds(attempt));
+                }
+            }
+
+            return null;
+        }
+
+        private async Task AttachSubtitleAsync(MediaSource source, SubtitleSource subtitle, byte[] data, int generation)
+        {
+            if (generation != _subtitleLoads)
+            {
+                return;
+            }
+
+            var label = string.IsNullOrEmpty(subtitle.Label) ? subtitle.Language : subtitle.Label;
+            if (data == null || data.Length == 0)
+            {
+                if (_externalSubtitlesPending > 0)
+                {
+                    _externalSubtitlesPending--;
+                }
+
+                Log("warn", "Subtitle failed (" + label + "): download");
+                if (_mediaPlayer?.Source is MediaPlaybackItem item)
+                {
+                    AutoSelectSubtitles(item);
+                }
+
+                return;
+            }
+
+            try
+            {
+                var stream = new Windows.Storage.Streams.InMemoryRandomAccessStream();
+                using (var writer = new Windows.Storage.Streams.DataWriter(stream))
+                {
+                    writer.WriteBytes(data);
+                    await writer.StoreAsync();
+                    writer.DetachStream();
+                }
+
+                stream.Seek(0);
+                if (generation != _subtitleLoads)
+                {
+                    return;
+                }
+
+                AddTimedText(source, TimedTextSource.CreateFromStream(stream), label);
+            }
+            catch (Exception ex)
+            {
+                if (_externalSubtitlesPending > 0)
+                {
+                    _externalSubtitlesPending--;
+                }
+
+                Log("warn", "Subtitle skipped (" + label + "): " + ex.Message);
+            }
+        }
+
+        private void AddTimedText(MediaSource source, TimedTextSource timedText, string label)
+        {
                     timedText.Resolved += (sender, args) =>
                     {
                         var failed = args.Error != null;
@@ -3816,20 +4046,6 @@ namespace StremioXbox
                         });
                     };
                     source.ExternalTimedTextSources.Add(timedText);
-                    if (!_externalSubtitleLanguages.ContainsKey(label))
-                    {
-                        _externalSubtitleLanguages[label] = language;
-                    }
-
-                    _externalSubtitlesPending++;
-                }
-                catch (Exception ex)
-                {
-                    Log("warn", "Subtitle skipped (" + subtitle.Label + "): " + ex.Message);
-                }
-            }
-
-            Log("info", "External subtitles: " + request.Subtitles.Count);
         }
 
         private static bool IsSubtitleTrack(TimedMetadataTrack track)

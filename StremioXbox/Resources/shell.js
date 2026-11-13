@@ -40,29 +40,6 @@
             }
         }
     }
-    // Stremio's web player checks a stream with a HEAD request the moment its page opens, before the native
-    // player takes over. For a debrid link that is a second resolve of the same file (Torrentio, then the
-    // debrid service's API), on every play, against API limits. The native player makes its own request, so
-    // while it is on, a HEAD from the player page is never sent (the web player is stopped right after).
-    if (host && window.XMLHttpRequest) {
-        try {
-            var xhrOpen = XMLHttpRequest.prototype.open;
-            var xhrSend = XMLHttpRequest.prototype.send;
-            XMLHttpRequest.prototype.open = function (method, url) {
-                this.__sxSkip = nativePlayerEnabled && /^head$/i.test(String(method)) && /^https?:/i.test(String(url)) &&
-                    location.hash.indexOf('#/player/') === 0;
-                return xhrOpen.apply(this, arguments);
-            };
-            XMLHttpRequest.prototype.send = function () {
-                if (this.__sxSkip) {
-                    return undefined;
-                }
-                return xhrSend.apply(this, arguments);
-            };
-        } catch (e) {
-        }
-    }
-
     var lastHandledStream = null;
     // Where the viewer was before Stremio's player page, to return there when that page stays behind the
     // native player (see leaveWebPlayer).
@@ -394,29 +371,44 @@
             }
             if (found) {
                 setFocus(found, 'center');
-            } else if (++tries < 20) {
-                setTimeout(attempt, 150); // Stremio renders the page a moment after the route changes.
+            } else if (++tries < (/^#\/detail\//.test(route) ? 80 : 20)) {
+                // Stremio renders the page a moment after the route changes; a title's streams come from the
+                // addons again when the viewer is back from playback, which can take Torrentio 10 s.
+                setTimeout(attempt, 150);
+            } else if (/^#\/detail\//.test(route) && !(highlighted && highlighted.isConnected)) {
+                focusFirstStream(route); // The stream is gone from the list: start on the first one.
             }
         })();
     }
 
     // A title's page opens with nothing highlighted, so the first press went to the back arrow. Highlight the
     // first stream that plays here (not the "Buy on ..." links), or the first episode, once Stremio lists them.
+    // Same title page: Stremio adds the video id to a movie's detail route (#/detail/movie/tt1 becomes
+    // #/detail/movie/tt1/tt1) right after it opens, which ended the wait before any stream arrived.
+    function sameDetail(a, b) {
+        var key = function (hash) { return String(hash || '').split('/').slice(0, 4).join('/'); };
+        return key(a) === key(b);
+    }
+
+    // Stremio keeps the page left behind (the board) mounted under the title page, so its poster stays
+    // "connected": only a highlight the viewer moved (a different element) ends the wait.
     function focusFirstStream(route) {
         var tries = 0;
+        var start = highlighted;
         (function attempt() {
-            if (location.hash !== route || (highlighted && highlighted.isConnected && document.contains(highlighted) && tries > 0)) {
+            if (!sameDetail(location.hash, route) || (highlighted && highlighted !== start && highlighted.isConnected && isCandidate(highlighted))) {
                 return; // Moved on, or the viewer already moved the highlight.
             }
-            var streams = Array.prototype.filter.call(document.querySelectorAll('a[class*="stream-container"], [class*="stream-container"] a, a[href^="#/player/"]'), function (el) {
-                return /^#\/player\//.test(el.getAttribute('href') || '') && isCandidate(el);
+            // Streams only (not the Trailer button, which also links to the player).
+            var streams = Array.prototype.filter.call(document.querySelectorAll('a[href^="#/player/"]'), function (el) {
+                return !!el.closest('[class*="stream-container"]') && isCandidate(el);
             });
             var episodes = streams.length ? [] : Array.prototype.filter.call(document.querySelectorAll('[class*="video-container"]'), isCandidate);
             var first = streams[0] || episodes[0];
             if (first) {
                 setFocus(first, 'nearest');
-            } else if (++tries < 25) {
-                setTimeout(attempt, 200); // Streams arrive from the addons a moment later.
+            } else if (++tries < 100) {
+                setTimeout(attempt, 200); // Streams arrive from the addons later (Torrentio can take 10 s and more).
             }
         })();
     }
@@ -778,6 +770,12 @@
         if (best && (direction === 'up' || direction === 'down')) {
             best = closerRow(fromRect, best, candidates, direction, from) || best;
         }
+        if (direction === 'right' && isPoster(from) && (!best || rowOf(best) !== rowOf(from))) {
+            // The end of a row: its See All, the way a TV app ends a row with a "more" tile.
+            var row = rowOf(from);
+            var seeAll = row && Array.prototype.filter.call(row.querySelectorAll('[class*="see-all"]'), isCandidate)[0];
+            best = seeAll || best;
+        }
         if (best) {
             setFocus(best, null, direction === 'up' || direction === 'down');
         }
@@ -787,9 +785,12 @@
     // Continue Watching row of 3 under the search bar at the right). The plain score skipped it for a row
     // further away that happened to have a poster underneath. Only posters count, so the side menu and
     // buttons keep the plain behaviour.
+    // From a poster, the next row's posters also win over its header link (See All sits above the row, at
+    // the right, so down from the last poster of a row landed on it instead of the poster below).
     function closerRow(fromRect, best, candidates, direction, from) {
         var bestRect = best.getBoundingClientRect();
         var down = direction === 'down';
+        var overHeader = isPoster(from) && !isPoster(best);
         var row = [];
         candidates.forEach(function (el) {
             if (el === from || el === best || from.contains(el) || el.contains(from) || !isPoster(el)) {
@@ -797,7 +798,8 @@
             }
             var r = el.getBoundingClientRect();
             var middle = r.top + r.height / 2;
-            var ahead = down ? r.top >= fromRect.bottom - 1 && middle < bestRect.top : r.bottom <= fromRect.top + 1 && middle > bestRect.bottom;
+            var ahead = down ? r.top >= fromRect.bottom - 1 && (overHeader || middle < bestRect.top) :
+                r.bottom <= fromRect.top + 1 && (overHeader || middle > bestRect.bottom);
             if (ahead) {
                 row.push({ el: el, r: r, gap: down ? r.top - fromRect.bottom : fromRect.top - r.bottom });
             }
@@ -806,6 +808,9 @@
             return null;
         }
         var nearestGap = Math.min.apply(null, row.map(function (c) { return c.gap; }));
+        if (overHeader && nearestGap > fromRect.height) {
+            return null; // No poster row right there: the link (a button below the last row) stays.
+        }
         var fx = fromRect.left + fromRect.width / 2;
         var pick = null;
         row.forEach(function (c) {
@@ -818,6 +823,10 @@
             }
         });
         return pick ? pick.el : null;
+    }
+
+    function rowOf(element) {
+        return element && element.closest ? element.closest('[class*="board-row"]') : null;
     }
 
     function isPoster(element) {

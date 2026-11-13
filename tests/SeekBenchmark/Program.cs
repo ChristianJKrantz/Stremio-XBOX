@@ -20,7 +20,10 @@ internal static class Program
     private static readonly int BytesPerSecond = int.Parse(Environment.GetEnvironmentVariable("MBPS") ?? "25") * 1024 * 1024;
     private static readonly int ColdMs = int.Parse(Environment.GetEnvironmentVariable("COLD_MS") ?? "1500");
     private static readonly List<long> Served = new List<long>();
+    private static readonly int Limit = int.Parse(Environment.GetEnvironmentVariable("LIMIT") ?? "0"); // Connections the server allows (0 = any).
     private static int _requests;
+    private static int _active;
+    private static int _refused;
 
     private static byte At(long p) => (byte)((p * 31) ^ (p >> 11));
 
@@ -54,17 +57,34 @@ internal static class Program
             await Task.Delay(1000);
         }
 
+        // Playing on: read at a video's pace while read-ahead fills the window, as during a film. Debrid CDNs
+        // block an address that sends too many requests, so the requests per MB matter.
+        var before = _requests;
+        var downloaded = cache.DownloadedBytes;
+        var playhead = (1700L << 20) + (32 << 20);
+        var play = Stopwatch.StartNew();
+        while (play.Elapsed < TimeSpan.FromSeconds(20))
+        {
+            await ReadRange(cache, playhead, 1 << 20, "playing");
+            playhead += 1 << 20;
+            await Task.Delay(250); // 4 MB/s, a 32 Mbps film.
+        }
+
+        var playedMb = (cache.DownloadedBytes - downloaded) / 1048576.0;
+        results.Add(string.Format("playing 20 s: {0:0} MB downloaded with {1} requests ({2:0.0} MB per request)",
+            playedMb, _requests - before, playedMb / Math.Max(1, _requests - before)));
+
         foreach (var line in results)
         {
             Console.WriteLine(line);
         }
 
-        Console.WriteLine("requests: " + _requests + ", data verified OK");
+        Console.WriteLine("requests: " + _requests + (Limit > 0 ? ", refused with 429: " + _refused : string.Empty) + ", data verified OK");
         lock (log)
         {
             foreach (var line in log)
             {
-                if (line.Contains("Seek:") || line.Contains("failed") || line.StartsWith("error"))
+                if (line.Contains("Seek:") || line.Contains("failed") || line.StartsWith("error") || line.Contains("too many"))
                 {
                     Console.WriteLine("  log: " + line);
                 }
@@ -149,36 +169,25 @@ internal static class Program
                     }
 
                     Interlocked.Increment(ref _requests);
-                    bool cold;
-                    lock (Served)
+                    if (Limit > 0 && Interlocked.Increment(ref _active) > Limit)
                     {
-                        cold = !Served.Exists(p => Math.Abs(p - from) < (64L << 20));
-                        Served.Add(from);
+                        // Like TorBox's CDN past 20 connections per server: refuse with 429.
+                        Interlocked.Decrement(ref _active);
+                        Interlocked.Increment(ref _refused);
+                        var refusal = Encoding.ASCII.GetBytes("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nContent-Length: 0\r\n\r\n");
+                        await stream.WriteAsync(refusal, 0, refusal.Length);
+                        continue;
                     }
 
-                    await Task.Delay(cold ? ColdMs : 150);
-                    var header = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/x-matroska\r\nAccept-Ranges: bytes\r\n" +
-                        "Content-Range: bytes " + from + "-" + to + "/" + FileSize + "\r\nContent-Length: " + (to - from + 1) + "\r\n\r\n";
-                    var headerBytes = Encoding.ASCII.GetBytes(header);
-                    await stream.WriteAsync(headerBytes, 0, headerBytes.Length);
-                    var block = new byte[64 * 1024];
-                    var watch = Stopwatch.StartNew();
-                    long sent = 0;
-                    for (var p = from; p <= to;)
+                    try
                     {
-                        var n = (int)Math.Min(block.Length, to - p + 1);
-                        for (var i = 0; i < n; i++)
+                        await Send(stream, from, to);
+                    }
+                    finally
+                    {
+                        if (Limit > 0)
                         {
-                            block[i] = At(p + i);
-                        }
-
-                        await stream.WriteAsync(block, 0, n);
-                        p += n;
-                        sent += n;
-                        var due = sent * 1000L / BytesPerSecond - watch.ElapsedMilliseconds;
-                        if (due > 0)
-                        {
-                            await Task.Delay((int)due);
+                            Interlocked.Decrement(ref _active);
                         }
                     }
                 }
@@ -186,6 +195,42 @@ internal static class Program
             catch (Exception)
             {
                 // Client went away (e.g. a cancelled download).
+            }
+        }
+    }
+
+    private static async Task Send(NetworkStream stream, long from, long to)
+    {
+        bool cold;
+        lock (Served)
+        {
+            cold = !Served.Exists(p => Math.Abs(p - from) < (64L << 20));
+            Served.Add(from);
+        }
+
+        await Task.Delay(cold ? ColdMs : 150);
+        var header = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/x-matroska\r\nAccept-Ranges: bytes\r\n" +
+            "Content-Range: bytes " + from + "-" + to + "/" + FileSize + "\r\nContent-Length: " + (to - from + 1) + "\r\n\r\n";
+        var headerBytes = Encoding.ASCII.GetBytes(header);
+        await stream.WriteAsync(headerBytes, 0, headerBytes.Length);
+        var block = new byte[64 * 1024];
+        var watch = Stopwatch.StartNew();
+        long sent = 0;
+        for (var p = from; p <= to;)
+        {
+            var n = (int)Math.Min(block.Length, to - p + 1);
+            for (var i = 0; i < n; i++)
+            {
+                block[i] = At(p + i);
+            }
+
+            await stream.WriteAsync(block, 0, n);
+            p += n;
+            sent += n;
+            var due = sent * 1000L / BytesPerSecond - watch.ElapsedMilliseconds;
+            if (due > 0)
+            {
+                await Task.Delay((int)due);
             }
         }
     }

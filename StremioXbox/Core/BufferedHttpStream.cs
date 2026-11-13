@@ -54,7 +54,11 @@ namespace StremioXbox.Core
         private readonly long _chunkCount;
         private readonly long _aheadChunks;
         private readonly long _behindChunks;
-        private int _connections; // Read-ahead connections; AddConnections raises it up to MaxConnections.
+        private int _connections; // Read-ahead connections; AddConnections raises it up to _connectionCeiling.
+        private int _connectionCeiling = MaxConnections; // Lowered when the server says too many.
+        private int _retiring; // Read-ahead workers to stop (the server said too many connections).
+        private DateTime _throttledUntil = DateTime.MinValue;
+        private DateTime _lastThrottleCut = DateTime.MinValue;
         private readonly Action<string, string> _log;
         private Uri _url;
         private DateTime _resolvedAt = DateTime.UtcNow;
@@ -125,7 +129,11 @@ namespace StremioXbox.Core
         }
 
         /// <summary>The most read-ahead connections AddConnections goes to (each holds one chunk in flight).</summary>
-        public const int MaxConnections = 12;
+        // TorBox's CDN refuses (HTTP 429) more than 20 connections per server and account, and an address
+        // that keeps asking after that gets blocked for about an hour. 10 read-ahead connections, the urgent
+        // one and the probe stay well under it; more never made the download faster (5-8 Mbps each, ~60 total).
+        public const int MaxConnections = 10;
+        private const int MinConnections = 4;
 
         public long Size { get; }
 
@@ -146,7 +154,7 @@ namespace StremioXbox.Core
                     return 0;
                 }
 
-                added = Math.Max(0, Math.Min(count, MaxConnections - _connections));
+                added = Math.Max(0, Math.Min(count, _connectionCeiling - _connections));
                 _connections += added;
             }
 
@@ -167,6 +175,9 @@ namespace StremioXbox.Core
 
         /// <summary>Gets the chunk the read-ahead window starts at (where the player last read).</summary>
         public long PlayheadChunk => Interlocked.Read(ref _playheadChunk);
+
+        /// <summary>Gets how many reads the player has made.</summary>
+        public int ReadCount => Volatile.Read(ref _readCount);
 
         /// <summary>Gets the total bytes received from the network.</summary>
         public long DownloadedBytes => Interlocked.Read(ref _downloadedBytes);
@@ -779,22 +790,66 @@ namespace StremioXbox.Core
             }
         }
 
+        // How many chunks one read-ahead request may cover. TorBox's CDN servers block the address for about
+        // an hour after a few hundred requests in a minute or so: with one 1 MB request per chunk that came
+        // about 50 s into a 4K film (three servers in one afternoon). Near the playhead each chunk still gets
+        // its own request, so they arrive in parallel and playback starts quickly; further ahead one request
+        // fetches up to 8 MB in a row, which cuts the request rate about eight times while playing.
+        private const int MaxRunChunks = 8;
+
         private async Task WorkerAsync(bool urgentOnly)
         {
             var token = _cts.Token;
             while (!token.IsCancellationRequested)
             {
-                Chunk chunk;
-                lock (_lock)
+                if (!urgentOnly && TryRetire())
                 {
-                    chunk = _disposed ? null : PickNextLocked(urgentOnly);
-                    if (chunk != null)
+                    return; // One connection fewer.
+                }
+
+                var wait = _throttledUntil - DateTime.UtcNow;
+                if (wait > TimeSpan.Zero)
+                {
+                    try
                     {
-                        chunk.Downloading = true;
+                        await Task.Delay(wait, token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
                     }
                 }
 
-                if (chunk == null)
+                List<Chunk> run = null;
+                lock (_lock)
+                {
+                    var chunk = _disposed ? null : PickNextLocked(urgentOnly);
+                    if (chunk != null)
+                    {
+                        chunk.Downloading = true;
+                        run = new List<Chunk> { chunk };
+                        var ahead = chunk.Index - _playheadChunk;
+                        var most = urgentOnly || chunk.Waiters > 0 || ahead < 12 ? 1 : (int)Math.Min(MaxRunChunks, ahead / 8 + 1);
+                        var last = Math.Min(_chunkCount - 1, _playheadChunk + _aheadChunks);
+                        for (var i = chunk.Index + 1; run.Count < most && i <= last; i++)
+                        {
+                            if (!_chunks.TryGetValue(i, out var next))
+                            {
+                                next = new Chunk(i);
+                                _chunks[i] = next;
+                            }
+                            else if (next.Data != null || next.Downloading || next.Waiters > 0)
+                            {
+                                break;
+                            }
+
+                            next.Downloading = true;
+                            run.Add(next);
+                        }
+                    }
+                }
+
+                if (run == null)
                 {
                     try
                     {
@@ -808,58 +863,62 @@ namespace StremioXbox.Core
                     continue;
                 }
 
-                await DownloadChunkAsync(chunk, token);
+                await DownloadRunAsync(run, token);
             }
         }
 
-        private async Task DownloadChunkAsync(Chunk chunk, CancellationToken token)
+        // Downloads consecutive chunks with one range request, handing each one over as soon as its bytes are
+        // in. A retry continues from the first chunk not finished yet.
+        private async Task DownloadRunAsync(List<Chunk> run, CancellationToken token)
         {
-            var start = chunk.Index * ChunkSize;
-            var length = (int)Math.Min(ChunkSize, Size - start);
-            byte[] buffer;
             var cancel = CancellationTokenSource.CreateLinkedTokenSource(token);
-            var mine = cancel.Token; // Also cancelled when a seek leaves this chunk behind.
+            var mine = cancel.Token; // Also cancelled when a seek leaves these chunks behind.
+            var buffers = new byte[run.Count][];
             lock (_lock)
             {
-                buffer = _pool.Count > 0 ? _pool.Pop() : null;
+                for (var i = 0; i < run.Count; i++)
+                {
+                    buffers[i] = (_pool.Count > 0 ? _pool.Pop() : null) ?? new byte[ChunkSize];
+                    run[i].Partial = buffers[i];
+                    run[i].Received = 0;
+                    run[i].Cancel = cancel;
+                }
             }
 
-            if (buffer == null)
-            {
-                buffer = new byte[ChunkSize];
-            }
-
-            lock (_lock)
-            {
-                chunk.Partial = buffer;
-                chunk.Received = 0;
-                chunk.Cancel = cancel;
-            }
-
+            var done = 0; // Chunks of the run handed over.
+            var throttleWaits = 0;
             try
             {
                 Exception last = null;
-                for (var attempt = 1; attempt <= MaxAttempts && !mine.IsCancellationRequested; attempt++)
+                for (var attempt = 1; attempt <= MaxAttempts && !mine.IsCancellationRequested && done < run.Count; attempt++)
                 {
                     var started = DateTime.UtcNow;
+                    var first = run[done];
                     lock (_lock)
                     {
-                        chunk.Received = 0; // A retry writes the same bytes again from the start.
+                        first.Received = 0; // A retry writes the same bytes again from the start of this chunk.
                     }
 
+                    var start = first.Index * ChunkSize;
+                    var end = Math.Min(Size, (run[run.Count - 1].Index + 1) * ChunkSize) - 1;
                     using (var stall = CancellationTokenSource.CreateLinkedTokenSource(mine))
                     try
                     {
                         stall.CancelAfter(StallTimeout);
                         using (var request = new HttpRequestMessage(HttpMethod.Get, _url))
                         {
-                            request.Headers.TryAppendWithoutValidation("Range", "bytes=" + start + "-" + (start + length - 1));
+                            request.Headers.TryAppendWithoutValidation("Range", "bytes=" + start + "-" + end);
                             using (var response = await _client.SendRequestAsync(request, HttpCompletionOption.ResponseHeadersRead).AsTask(stall.Token))
                             {
                                 var code = (int)response.StatusCode;
                                 if (code == 401 || code == 403 || code == 404 || code == 410)
                                 {
                                     throw new LinkExpiredException("HTTP " + code);
+                                }
+
+                                if (code == 429 || code == 503)
+                                {
+                                    throw new ThrottledException(code, response.Headers.RetryAfter?.Delta);
                                 }
 
                                 if (code != 206)
@@ -869,77 +928,95 @@ namespace StremioXbox.Core
 
                                 using (var input = await response.Content.ReadAsInputStreamAsync().AsTask(stall.Token))
                                 {
-                                    var offset = 0;
-                                    while (offset < length)
+                                    while (done < run.Count)
                                     {
-                                        stall.CancelAfter(StallTimeout);
-                                        var target = buffer.AsBuffer(offset, 0, length - offset);
-                                        var result = await input.ReadAsync(target, (uint)(length - offset), InputStreamOptions.Partial).AsTask(stall.Token);
-                                        if (result.Length == 0)
+                                        var chunk = run[done];
+                                        var buffer = buffers[done];
+                                        var length = (int)Math.Min(ChunkSize, Size - (chunk.Index * ChunkSize));
+                                        var offset = 0;
+                                        while (offset < length)
                                         {
-                                            throw new InvalidOperationException("connection closed after " + offset + " bytes");
+                                            stall.CancelAfter(StallTimeout);
+                                            var target = buffer.AsBuffer(offset, 0, length - offset);
+                                            var result = await input.ReadAsync(target, (uint)(length - offset), InputStreamOptions.Partial).AsTask(stall.Token);
+                                            if (result.Length == 0)
+                                            {
+                                                throw new InvalidOperationException("connection closed after " + offset + " bytes of chunk " + chunk.Index);
+                                            }
+
+                                            if (!ReferenceEquals(result, target))
+                                            {
+                                                result.CopyTo(0, buffer, offset, (int)result.Length);
+                                            }
+
+                                            offset += (int)result.Length;
+                                            Interlocked.Add(ref _downloadedBytes, result.Length);
+                                            Progressed(chunk, offset);
                                         }
 
-                                        if (!ReferenceEquals(result, target))
+                                        if (!Complete(chunk, buffer, length))
                                         {
-                                            result.CopyTo(0, buffer, offset, (int)result.Length);
+                                            return; // Closing.
                                         }
 
-                                        offset += (int)result.Length;
-                                        Interlocked.Add(ref _downloadedBytes, result.Length);
-                                        Progressed(chunk, offset);
+                                        buffers[done] = null;
+                                        done++;
+                                        var elapsed = (DateTime.UtcNow - started).TotalMilliseconds;
+                                        var slow = elapsed > 3000 * run.Count;
+                                        if (chunk.Index < 2 || (done == run.Count && slow))
+                                        {
+                                            _log(slow ? "warn" : "info", string.Format(
+                                                "Chunk {0}: {1:0.0} MB in {2:0} ms ({3:0} Mbps), {4} chunk(s) per request, attempt {5}",
+                                                chunk.Index, (end - start + 1) / 1048576.0, elapsed, (end - start + 1) * 8 / elapsed / 1000, run.Count, attempt));
+                                        }
                                     }
                                 }
                             }
                         }
-
-                        TaskCompletionSource<bool> progress;
-                        lock (_lock)
-                        {
-                            chunk.Downloading = false;
-                            chunk.Partial = null;
-                            chunk.Cancel = null;
-                            if (_disposed)
-                            {
-                                return;
-                            }
-
-                            chunk.Data = buffer;
-                            chunk.Length = length;
-                            chunk.LastUsed = ++_useCounter;
-                            progress = chunk.Progress;
-                            EvictLocked();
-                        }
-
-                        chunk.Ready.TrySetResult(true);
-                        progress.TrySetResult(true);
-                        var elapsed = (DateTime.UtcNow - started).TotalMilliseconds;
-                        if (chunk.Index < 2 || elapsed > 3000)
-                        {
-                            _log(elapsed > 3000 ? "warn" : "info", string.Format("Chunk {0}: {1:0.0} MB in {2:0} ms ({3:0} Mbps), attempt {4}", chunk.Index, length / 1048576.0, elapsed, length * 8 / elapsed / 1000, attempt));
-                        }
-
-                        return;
                     }
                     catch (Exception) when (mine.IsCancellationRequested)
                     {
-                        break; // Closing, or a seek made this chunk stale.
+                        break; // Closing, or a seek made these chunks stale.
                     }
                     catch (Exception) when (stall.IsCancellationRequested)
                     {
                         last = new TimeoutException("no data for " + StallTimeout.TotalSeconds + " s");
-                        _log("warn", "Chunk " + chunk.Index + " attempt " + attempt + ": no data for " + StallTimeout.TotalSeconds + " s; retrying");
+                        _log("warn", "Chunk " + run[done].Index + " attempt " + attempt + ": no data for " + StallTimeout.TotalSeconds + " s; retrying");
+                        if (attempt >= 2)
+                        {
+                            await ReResolveAfterStallAsync();
+                        }
                     }
                     catch (LinkExpiredException ex)
                     {
                         last = ex;
-                        _log("warn", "Chunk " + chunk.Index + ": " + ex.Message + "; resolving the link again");
+                        _log("warn", "Chunk " + run[done].Index + ": " + ex.Message + "; resolving the link again");
                         await ReResolveAsync();
+                    }
+                    catch (ThrottledException ex)
+                    {
+                        // Not a failed attempt: the server only asks to slow down. Waiting (and one connection
+                        // fewer) keeps the address from being blocked; asking again at once is what gets it blocked.
+                        last = ex;
+                        if (throttleWaits++ < 12)
+                        {
+                            attempt--;
+                        }
+
+                        var pause = Throttled(ex);
+                        try
+                        {
+                            await Task.Delay(pause, mine);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
                     }
                     catch (Exception ex)
                     {
                         last = ex;
-                        _log("warn", "Chunk " + chunk.Index + " attempt " + attempt + " failed: " + ex.GetType().Name + " " + ex.Message);
+                        _log("warn", "Chunk " + run[done].Index + " attempt " + attempt + " failed: " + ex.GetType().Name + " " + ex.Message);
                         try
                         {
                             await Task.Delay(500 * attempt, mine);
@@ -951,29 +1028,76 @@ namespace StremioXbox.Core
                     }
                 }
 
+                if (done >= run.Count)
+                {
+                    return;
+                }
+
+                // The rest of the run: the first unfinished chunk failed (or all were cancelled by a seek or
+                // closing); the chunks after it go back to the queue untouched.
+                var failed = mine.IsCancellationRequested ? null : run[done];
                 lock (_lock)
                 {
-                    chunk.Downloading = false;
-                    chunk.Partial = null;
-                    chunk.Cancel = null;
-                    _pool.Push(buffer);
-                    if (!mine.IsCancellationRequested && _chunks.TryGetValue(chunk.Index, out var current) && current == chunk)
+                    for (var i = done; i < run.Count; i++)
                     {
-                        // Drop it so the next read creates a fresh chunk and tries again.
-                        _chunks.Remove(chunk.Index);
+                        var chunk = run[i];
+                        chunk.Downloading = false;
+                        chunk.Partial = null;
+                        chunk.Cancel = null;
+                        if (buffers[i] != null)
+                        {
+                            _pool.Push(buffers[i]);
+                            buffers[i] = null;
+                        }
+
+                        // Drop the failed one so the next read creates a fresh chunk and tries again, and the
+                        // untouched ones nobody waits for, which read-ahead creates again.
+                        if ((chunk == failed || chunk.Waiters == 0) && _chunks.TryGetValue(chunk.Index, out var current) && current == chunk)
+                        {
+                            _chunks.Remove(chunk.Index);
+                        }
                     }
                 }
 
-                if (!mine.IsCancellationRequested)
+                if (failed != null)
                 {
-                    _log("error", "Chunk " + chunk.Index + " failed after " + MaxAttempts + " attempts: " + last?.Message);
-                    chunk.Ready.TrySetException(new System.IO.IOException("Download failed: " + last?.Message, last));
+                    NetworkFailure = last?.Message ?? "download failed";
+                    _log("error", "Chunk " + failed.Index + " failed after " + MaxAttempts + " attempts: " + last?.Message);
+                    failed.Ready.TrySetException(new System.IO.IOException("Download failed: " + last?.Message, last));
                 }
+
+                Wake();
             }
             finally
             {
                 cancel.Dispose();
             }
+        }
+
+        // Hands a downloaded chunk to readers. False when the cache is closing.
+        private bool Complete(Chunk chunk, byte[] buffer, int length)
+        {
+            TaskCompletionSource<bool> progress;
+            lock (_lock)
+            {
+                chunk.Downloading = false;
+                chunk.Partial = null;
+                chunk.Cancel = null;
+                if (_disposed)
+                {
+                    return false;
+                }
+
+                chunk.Data = buffer;
+                chunk.Length = length;
+                chunk.LastUsed = ++_useCounter;
+                progress = chunk.Progress;
+                EvictLocked();
+            }
+
+            chunk.Ready.TrySetResult(true);
+            progress.TrySetResult(true);
+            return true;
         }
 
         // Publishes newly arrived bytes to reads waiting inside this chunk.
@@ -1015,6 +1139,137 @@ namespace StremioXbox.Core
             {
                 _resolving.Release();
             }
+        }
+
+        /// <summary>
+        /// Gets why a chunk could not be downloaded at all (null while every download works): the page tells
+        /// the viewer the server stopped responding instead of reporting the player's decoding error.
+        /// </summary>
+        public string NetworkFailure
+        {
+            get
+            {
+                var failure = _networkFailure;
+                return failure != null && unchecked(Environment.TickCount - _networkFailedAt) < 60000 ? failure : null;
+            }
+
+            private set
+            {
+                _networkFailedAt = Environment.TickCount;
+                _networkFailure = value;
+            }
+        }
+
+        private volatile string _networkFailure;
+        private int _networkFailedAt;
+
+        // A debrid CDN server can stop answering in the middle of a film (TorBox servers refused every
+        // connection for about an hour). Asking the debrid service for the link again may hand out another
+        // server. Once a minute at most: each try is a call against the service's API limits, and every
+        // connection stalls at the same moment.
+        private async Task ReResolveAfterStallAsync()
+        {
+            await _resolving.WaitAsync();
+            try
+            {
+                if (DateTime.UtcNow - _stallResolvedAt < TimeSpan.FromSeconds(60))
+                {
+                    return;
+                }
+
+                _stallResolvedAt = DateTime.UtcNow;
+                var oldHost = _url?.Host;
+                var probe = await ResolveAsync(_sourceUrl, _log);
+                _resolvedAt = DateTime.UtcNow;
+                if (probe?.FinalUrl != null)
+                {
+                    _url = probe.FinalUrl;
+                    _log(probe.FinalUrl.Host == oldHost ? "warn" : "info", probe.FinalUrl.Host == oldHost
+                        ? "Server " + oldHost + " stopped sending; the debrid service still points to it"
+                        : "Server " + oldHost + " stopped sending; switched to " + probe.FinalUrl.Host);
+                }
+                else
+                {
+                    _log("warn", "Server " + oldHost + " stopped sending; asking for the link again failed");
+                }
+            }
+            finally
+            {
+                _resolving.Release();
+            }
+        }
+
+        private DateTime _stallResolvedAt = DateTime.MinValue;
+
+        // The server said too many requests or connections: every connection pauses (Retry-After, else 3 s,
+        // at most 30 s), and once per 10 s one read-ahead connection stops for good, down to MinConnections.
+        private TimeSpan Throttled(ThrottledException ex)
+        {
+            var pause = ex.RetryAfter ?? TimeSpan.FromSeconds(3);
+            if (pause > TimeSpan.FromSeconds(30))
+            {
+                pause = TimeSpan.FromSeconds(30);
+            }
+
+            string note = null;
+            lock (_lock)
+            {
+                var until = DateTime.UtcNow + pause;
+                if (until > _throttledUntil)
+                {
+                    _throttledUntil = until;
+                }
+
+                if (DateTime.UtcNow - _lastThrottleCut > TimeSpan.FromSeconds(10))
+                {
+                    _lastThrottleCut = DateTime.UtcNow;
+                    var fewer = string.Empty;
+                    if (_connections > MinConnections)
+                    {
+                        _connections--;
+                        _connectionCeiling = _connections;
+                        Interlocked.Increment(ref _retiring);
+                        fewer = "; connections down to " + _connections;
+                    }
+
+                    note = "Server said too many connections (HTTP " + ex.Code + "): pausing " + pause.TotalSeconds.ToString("0") + " s" + fewer;
+                }
+            }
+
+            if (note != null)
+            {
+                _log("warn", note);
+            }
+
+            return pause;
+        }
+
+        private bool TryRetire()
+        {
+            int retiring;
+            while ((retiring = Volatile.Read(ref _retiring)) > 0)
+            {
+                if (Interlocked.CompareExchange(ref _retiring, retiring - 1, retiring) == retiring)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private sealed class ThrottledException : Exception
+        {
+            public ThrottledException(int code, TimeSpan? retryAfter)
+                : base("HTTP " + code + " (too many connections)")
+            {
+                Code = code;
+                RetryAfter = retryAfter;
+            }
+
+            public int Code { get; }
+
+            public TimeSpan? RetryAfter { get; }
         }
 
         private sealed class LinkExpiredException : Exception

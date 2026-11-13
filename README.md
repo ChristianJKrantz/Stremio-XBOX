@@ -143,6 +143,11 @@ freezes the picture. Stremio-XBOX puts its own cache in between:
   the best track wins: Atmos, then more channels, then Dolby Digital Plus, DTS, Dolby Digital, AAC.
   Commentary and audio description are never picked first. A co-production listed under the wrong
   country can pick the other language; Y and X change it.
+- **Subtitles inside the video file can stutter 4K playback.** With one on, the Xbox player reads ahead
+  through the file for the next line; on a track with lines only for some scenes it gets so far ahead that
+  the picture can't keep up. So the player turns on a downloaded subtitle (from a subtitle addon) first, and
+  one inside the file only when no downloaded one in that language arrives. If a video stutters with
+  subtitles on, pick a downloaded one with X.
 - Built for direct / debrid links. Torrent streams need a streaming server.
 
 ## 🎮 Controls

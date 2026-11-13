@@ -411,6 +411,12 @@ namespace StremioXbox.Core
                     stats.Waits++;
                     stats.WaitMs += elapsedMs;
                     stats.MaxWaitMs = Math.Max(stats.MaxWaitMs, elapsedMs);
+
+                    // Where the slow reads were, relative to the read-ahead playhead: near it (the video being
+                    // played is late) or far ahead (the player buffering ahead at the download edge).
+                    var ahead = position - (Interlocked.Read(ref _playheadChunk) * ChunkSize);
+                    stats.WaitAheadMin = Math.Min(stats.WaitAheadMin, ahead);
+                    stats.WaitAheadMax = Math.Max(stats.WaitAheadMax, ahead);
                 }
             }
         }
@@ -429,8 +435,9 @@ namespace StremioXbox.Core
                         continue;
                     }
 
-                    text.AppendFormat(" v{0} {1} reads {2} MB at {3}-{4} MB, waits {5} ({6} ms total, max {7});",
-                        pair.Key, stats.Reads, stats.Bytes >> 20, stats.MinPosition >> 20, stats.MaxPosition >> 20, stats.Waits, stats.WaitMs, stats.MaxWaitMs);
+                    text.AppendFormat(" v{0} {1} reads {2} MB at {3}-{4} MB, waits {5} ({6} ms total, max {7}{8});",
+                        pair.Key, stats.Reads, stats.Bytes >> 20, stats.MinPosition >> 20, stats.MaxPosition >> 20, stats.Waits, stats.WaitMs, stats.MaxWaitMs,
+                        stats.Waits > 0 ? string.Format(", at {0}..{1} MB from the playhead", stats.WaitAheadMin >> 20, stats.WaitAheadMax >> 20) : string.Empty);
                     pair.Value.Reset();
                 }
 
@@ -452,6 +459,8 @@ namespace StremioXbox.Core
             public int Waits;
             public long WaitMs;
             public int MaxWaitMs;
+            public long WaitAheadMin = long.MaxValue;
+            public long WaitAheadMax = long.MinValue;
 
             public void Reset()
             {
@@ -462,6 +471,8 @@ namespace StremioXbox.Core
                 Waits = 0;
                 WaitMs = 0;
                 MaxWaitMs = 0;
+                WaitAheadMin = long.MaxValue;
+                WaitAheadMax = long.MinValue;
             }
         }
 
@@ -1057,8 +1068,9 @@ namespace StremioXbox.Core
                         // Return what is already in memory rather than holding the player on a later chunk
                         // (a byte stream may return fewer bytes than asked; only 0 means end of file). Only at
                         // a chunk boundary: inside a chunk that is still arriving, keep waiting for the bytes
-                        // asked for. Handing back a few KB at a time made Media Foundation reject the file
-                        // (MF_E_UNSUPPORTED_BYTESTREAM_TYPE) when its first header reads came back short.
+                        // asked for. A few KB handed back mid-chunk made Media Foundation reject the file
+                        // (MF_E_UNSUPPORTED_BYTESTREAM_TYPE) on its first header reads, and fail playback
+                        // (MF_E_UNEXPECTED, "couldn't be decoded") on a read right after the file opened.
                         var atChunkEnd = _position % (ulong)HttpChunkCache.ChunkSize == 0;
                         if (options == InputStreamOptions.Partial || (atChunkEnd && !_cache.IsAvailable((long)_position)))
                         {

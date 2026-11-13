@@ -120,6 +120,16 @@ namespace StremioXbox
         private bool _upNextDismissed;
         private bool _subtitleUserChoice;
         private bool _subtitleAutoDone;
+
+        // External (addon) subtitles by label, with their language: a downloaded subtitle file has no language of
+        // its own. Preferred over subtitles inside the video file: with one of those on, the Xbox player reads
+        // ahead through the file for the next line, and on a sparse track (lines only for some scenes) it ran
+        // hundreds of MB ahead at the download edge, holding up the picture (2 s of video per 5 s).
+        private readonly Dictionary<string, string> _externalSubtitleLanguages = new Dictionary<string, string>();
+        private int _externalSubtitlesPending; // Added but not loaded (or failed) yet.
+        private bool _embeddedSubtitleAllowed; // No downloaded subtitle in the language came in time.
+        private bool _subtitleWaiting;
+        private int _subtitleGeneration;
         private volatile bool _audioDecided;  // The first audio choice is made (subtitles wait for it).
         private volatile bool _originalAudio; // A foreign title plays in its own language: English subtitles on.
 
@@ -911,6 +921,9 @@ namespace StremioXbox
             ApplyIntro(request.IntroFromMs, request.IntroToMs);
             _subtitleUserChoice = false;
             _subtitleAutoDone = false;
+            _embeddedSubtitleAllowed = false;
+            _subtitleWaiting = false;
+            _subtitleGeneration++;
             _audioDecided = false;
             _originalAudio = false;
             _reopening = false;
@@ -1910,6 +1923,12 @@ namespace StremioXbox
                         Log("info", "Dolby Vision in the name but decoded as HDR10 (profile 7/8 base layer)");
                         AddOsdNote("Dolby Vision profile 7/8 plays as HDR10 on Xbox");
                     }
+                }
+
+                // The player can fail (and be closed) while the display mode switches; its session then throws.
+                if (sender != _mediaPlayer)
+                {
+                    return;
                 }
 
                 if (!_displayRequestActive)
@@ -3150,25 +3169,87 @@ namespace StremioXbox
 
             try
             {
+                // A downloaded subtitle in the language first; one inside the video file only when none comes.
                 var tracks = item.TimedMetadataTracks;
+                var external = -1;
+                var embedded = -1;
                 for (var i = 0; i < tracks.Count; i++)
                 {
-                    if (IsSubtitleTrack(tracks[i]) && LanguageMatches(tracks[i].Language, language) && !IsForcedSubtitle(tracks[i]))
+                    if (!IsSubtitleTrack(tracks[i]) || IsForcedSubtitle(tracks[i]))
                     {
-                        _subtitleAutoDone = true;
-                        SelectSubtitle(item, i, false);
-                        if (_originalAudio)
-                        {
-                            AddOsdNote("English subtitles   ·   X to change");
-                        }
+                        continue;
+                    }
 
-                        return;
+                    if (IsExternalSubtitle(tracks[i], out var externalLanguage))
+                    {
+                        if (external < 0 && LanguageMatches(externalLanguage, language))
+                        {
+                            external = i;
+                        }
+                    }
+                    else if (embedded < 0 && LanguageMatches(tracks[i].Language, language))
+                    {
+                        embedded = i;
+                    }
+                }
+
+                var expectExternal = _externalSubtitlesPending > 0 &&
+                    _externalSubtitleLanguages.Values.Any(code => LanguageMatches(code, language));
+                if (external < 0 && embedded >= 0 && expectExternal && !_embeddedSubtitleAllowed)
+                {
+                    WaitForExternalSubtitles(item); // Falls back to the one in the file after a while.
+                    return;
+                }
+
+                var pick = external >= 0 ? external : embedded;
+                if (pick >= 0)
+                {
+                    _subtitleAutoDone = true;
+                    SelectSubtitle(item, pick, false);
+                    Log("info", "Subtitles chosen: " + DescribeSubtitle(tracks[pick]) + (external >= 0
+                        ? (embedded >= 0 ? " (downloaded, preferred over the one in the file)" : " (downloaded)")
+                        : " (in the file; no downloaded one in this language)"));
+                    if (_originalAudio)
+                    {
+                        AddOsdNote("English subtitles   ·   X to change");
                     }
                 }
             }
             catch (Exception ex)
             {
                 Log("warn", "Subtitle auto-select failed: " + ex.Message);
+            }
+        }
+
+        private bool IsExternalSubtitle(TimedMetadataTrack track, out string language)
+        {
+            language = null;
+            return !string.IsNullOrEmpty(track.Label) && _externalSubtitleLanguages.TryGetValue(track.Label, out language);
+        }
+
+        // Downloaded subtitles load one by one after the file opens; give them a few seconds before settling
+        // for the subtitle inside the file.
+        private async void WaitForExternalSubtitles(MediaPlaybackItem item)
+        {
+            if (_subtitleWaiting)
+            {
+                return;
+            }
+
+            _subtitleWaiting = true;
+            var generation = _subtitleGeneration;
+            await Task.Delay(TimeSpan.FromSeconds(12));
+            if (generation != _subtitleGeneration || _mediaPlayer?.Source != item)
+            {
+                return;
+            }
+
+            _subtitleWaiting = false;
+            if (!_subtitleAutoDone && !_subtitleUserChoice)
+            {
+                Log("info", "No downloaded subtitle in the language yet; using the one in the file");
+                _embeddedSubtitleAllowed = true;
+                AutoSelectSubtitles(item);
             }
         }
 
@@ -3261,6 +3342,8 @@ namespace StremioXbox
 
         private void AddExternalSubtitles(MediaSource source, PlayRequest request)
         {
+            _externalSubtitleLanguages.Clear();
+            _externalSubtitlesPending = 0;
             foreach (var subtitle in request.Subtitles)
             {
                 try
@@ -3270,18 +3353,42 @@ namespace StremioXbox
                     var timedText = TimedTextSource.CreateFromUri(new Uri(subtitle.Url));
                     timedText.Resolved += (sender, args) =>
                     {
-                        if (args.Error != null)
+                        var failed = args.Error != null;
+                        var error = failed ? args.Error.ErrorCode.ToString() : null;
+                        if (!failed)
                         {
-                            _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => Log("warn", "Subtitle failed (" + label + "): " + args.Error.ErrorCode));
-                            return;
+                            foreach (var track in args.Tracks)
+                            {
+                                track.Label = label;
+                            }
                         }
 
-                        foreach (var track in args.Tracks)
+                        _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
                         {
-                            track.Label = label;
-                        }
+                            if (_externalSubtitlesPending > 0)
+                            {
+                                _externalSubtitlesPending--;
+                            }
+
+                            if (failed)
+                            {
+                                Log("warn", "Subtitle failed (" + label + "): " + error);
+                            }
+
+                            // The last one in the language may have failed, or this one is the first to arrive.
+                            if (_mediaPlayer?.Source is MediaPlaybackItem current)
+                            {
+                                AutoSelectSubtitles(current);
+                            }
+                        });
                     };
                     source.ExternalTimedTextSources.Add(timedText);
+                    if (!_externalSubtitleLanguages.ContainsKey(label))
+                    {
+                        _externalSubtitleLanguages[label] = language;
+                    }
+
+                    _externalSubtitlesPending++;
                 }
                 catch (Exception ex)
                 {

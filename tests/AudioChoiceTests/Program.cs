@@ -60,6 +60,13 @@ internal static class Program
         Check("Japanese TrueHD loses to Japanese DD+", 2, true, "Japan",
             T("ja", "", AudioFormat.TrueHd, 8), T("en", "", AudioFormat.DolbyDigitalPlus, 6), T("ja", "", AudioFormat.DolbyDigitalPlus, 6));
 
+        Check("Japanese DTS-HD 5.1 loses to Japanese FLAC stereo", 2, true, "Japan",
+            T("ru", "", AudioFormat.DolbyDigital, 2), T("ja", "", AudioFormat.DtsHd, 6), T("ja", "", AudioFormat.Other, 2));
+        Check("DTS-HD loses to TrueHD in the same language", 1, false, "United States",
+            T("en", "", AudioFormat.DtsHd, 8), T("en", "", AudioFormat.TrueHd, 8));
+        Check("DTS-HD when it is the only track", 0, true, "Japan",
+            T("ja", "", AudioFormat.DtsHd, 2));
+
         Console.WriteLine(failures == 0 ? "ALL PASSED" : failures + " FAILED");
         return failures == 0 ? 0 : 1;
     }

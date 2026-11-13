@@ -134,9 +134,9 @@ freezes the picture. Stremio-XBOX puts its own cache in between:
 - **Dolby Vision Profile 7 / 8 play as HDR10.** The Xbox's decoder only outputs DV for Profile 5, and
   turning 7/8 into 5 would mean re-encoding the video, so an app can't change this. The player says so
   on screen when a DV release plays as HDR10. Pick a Profile 5 (often WEB-DL) stream for real DV.
-- **Dolby TrueHD can be silent on Xbox.** When a file also has another track in the same language, the
-  player starts on that one instead (Y still offers TrueHD). When TrueHD is the only track, it tells you,
-  so you can pick another stream if there's no sound.
+- **Dolby TrueHD can be silent on Xbox, and DTS-HD has no sound at all.** Both come from Blu-ray remuxes.
+  When a file also has another track in the same language, the player starts on that one instead (Y still
+  offers them). When one of them is the only track, it tells you, so you can pick another stream.
 - **Which audio track plays first.** English when the file has it. A foreign title (judged by its main
   country of production on Cinemeta, such as Japan or South Korea) plays in its original language with
   English subtitles when the file has that language, so you get the sub, not the dub. Within the language
@@ -148,6 +148,9 @@ freezes the picture. Stremio-XBOX puts its own cache in between:
   the picture can't keep up. So the player turns on a downloaded subtitle (from a subtitle addon) first, and
   one inside the file only when no downloaded one in that language arrives. If a video stutters with
   subtitles on, pick a downloaded one with X.
+- **Big remuxes need a fast link.** Debrid servers give each connection only 5-8 Mbps, so the player starts
+  with 6 and adds more (up to 12) while the download is slower than the file's bitrate. A stream's average
+  bitrate is about its size in GB x 143 / runtime in minutes; well above your connection's speed, it buffers.
 - Built for direct / debrid links. Torrent streams need a streaming server.
 
 ## 🎮 Controls

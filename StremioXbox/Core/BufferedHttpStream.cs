@@ -52,7 +52,7 @@ namespace StremioXbox.Core
         private readonly long _chunkCount;
         private readonly long _aheadChunks;
         private readonly long _behindChunks;
-        private readonly int _connections;
+        private int _connections; // Read-ahead connections; AddConnections raises it up to MaxConnections.
         private readonly Action<string, string> _log;
         private Uri _url;
         private DateTime _resolvedAt = DateTime.UtcNow;
@@ -95,7 +95,7 @@ namespace StremioXbox.Core
             var filter = new HttpBaseProtocolFilter();
             filter.CacheControl.ReadBehavior = HttpCacheReadBehavior.NoCache;
             filter.CacheControl.WriteBehavior = HttpCacheWriteBehavior.NoCache;
-            filter.MaxConnectionsPerServer = (uint)Math.Max(6, connections + 2);
+            filter.MaxConnectionsPerServer = (uint)Math.Max(MaxConnections, connections) + 2;
             _client = new HttpClient(filter);
 
             for (var i = 0; i < connections; i++)
@@ -108,7 +108,44 @@ namespace StremioXbox.Core
             Task.Run(() => WorkerAsync(true));
         }
 
+        /// <summary>The most read-ahead connections AddConnections goes to (each holds one 4 MB chunk in flight).</summary>
+        public const int MaxConnections = 12;
+
         public long Size { get; }
+
+        /// <summary>Gets the number of read-ahead connections.</summary>
+        public int Connections => Volatile.Read(ref _connections);
+
+        /// <summary>
+        /// Starts more read-ahead connections (up to MaxConnections), for a file whose bitrate the current ones
+        /// can't keep up with: debrid servers give each connection only 5-8 Mbps. Returns how many were added.
+        /// </summary>
+        public int AddConnections(int count)
+        {
+            int added;
+            lock (_lock)
+            {
+                if (_disposed)
+                {
+                    return 0;
+                }
+
+                added = Math.Max(0, Math.Min(count, MaxConnections - _connections));
+                _connections += added;
+            }
+
+            for (var i = 0; i < added; i++)
+            {
+                Task.Run(() => WorkerAsync(false));
+            }
+
+            if (added > 0)
+            {
+                Wake();
+            }
+
+            return added;
+        }
 
         public long AheadBytes { get; }
 
@@ -427,6 +464,7 @@ namespace StremioXbox.Core
             var text = new System.Text.StringBuilder("Views:");
             lock (_views)
             {
+
                 foreach (var pair in _views)
                 {
                     var stats = pair.Value;

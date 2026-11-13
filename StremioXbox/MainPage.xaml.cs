@@ -86,6 +86,11 @@ namespace StremioXbox
         private int _lastBackTick = Environment.TickCount - 1000;
         private bool _pageAtHome = true; // From shell.js route messages.
         private long _lastCacheBytes;
+
+        // More connections when the download falls behind the file's bitrate (see AdaptConnections).
+        private int _slowChecks;
+        private double _rateBeforeAdding;
+        private bool _connectionsMaxed;
         private string _osdMessage;
 
         // Startup / connection screen.
@@ -910,6 +915,9 @@ namespace StremioXbox
             Log("info", "Stream URL: " + request.Url);
             _fileSize = 0;
             _bitrateLogged = false;
+            _slowChecks = 0;
+            _rateBeforeAdding = 0;
+            _connectionsMaxed = false;
             _preparing = false;
             _starting = true;
             _hasPlayed = false;
@@ -1548,16 +1556,20 @@ namespace StremioXbox
                         notes.Add("Original " + LanguageName(decision.Language) + " audio");
                     }
 
-                    if (before != null && pick != current && IsTrueHd(before) && !IsTrueHd(chosen))
+                    if (before != null && pick != current && MaybeSilent(before) && !MaybeSilent(chosen))
                     {
-                        notes.Add(AudioFormatName(chosen) + " instead of Dolby TrueHD (often silent on Xbox)");
+                        notes.Add(AudioFormatName(chosen) + " instead of " + (IsDtsHd(before) ? "DTS-HD (no sound on Xbox)" : "Dolby TrueHD (often silent on Xbox)"));
+                    }
+                    else if (IsDtsHd(chosen))
+                    {
+                        notes.Add("DTS-HD audio has no sound on Xbox. Press Y for another track, or pick another stream");
                     }
                     else if (IsTrueHd(chosen))
                     {
                         notes.Add("Dolby TrueHD can be silent on Xbox. No sound? Press Y for another track, or pick another stream");
                     }
 
-                    _audioNote = notes.Count == 0 ? null : string.Join("   ·   ", notes) + (IsTrueHd(chosen) ? string.Empty : "   ·   Y to change");
+                    _audioNote = notes.Count == 0 ? null : string.Join("   ·   ", notes) + (MaybeSilent(chosen) ? string.Empty : "   ·   Y to change");
                     _originalAudio = decision.OriginalLanguage;
                 }
 
@@ -1594,6 +1606,7 @@ namespace StremioXbox
             switch (AudioFormatName(track))
             {
                 case "Dolby TrueHD": return AudioFormat.TrueHd;
+                case "DTS-HD": return AudioFormat.DtsHd;
                 case "Dolby Digital Plus": return AudioFormat.DolbyDigitalPlus;
                 case "Dolby Digital": return AudioFormat.DolbyDigital;
                 case "DTS": return AudioFormat.Dts;
@@ -1602,6 +1615,19 @@ namespace StremioXbox
                     return subtype.Contains("AAC") ? AudioFormat.Aac : AudioFormat.Other;
             }
         }
+
+        // DTS-HD (Master Audio, from Blu-ray remuxes) is listed by the Xbox player but plays no sound. Its
+        // MFAudioFormat_DTS_HD subtype has no WinRT name either, so it reads as its GUID.
+        private static bool IsDtsHd(AudioTrack track)
+        {
+            var subtype = (track.GetEncodingProperties().Subtype ?? string.Empty).ToUpperInvariant();
+            var label = (track.Label ?? string.Empty).ToUpperInvariant();
+            return subtype.Contains("A2E58EB7-0FA9-48BB-A40C-FA0E156D0645") || subtype.Contains("DTS_HD") || subtype.Contains("DTSHD") ||
+                label.Contains("DTS-HD") || label.Contains("DTS HD") || label.Contains("DTS:X") || label.Contains("DTS-X");
+        }
+
+        // Formats the Xbox player lists but may not play: the app avoids them and says so when it can't.
+        private static bool MaybeSilent(AudioTrack track) => IsTrueHd(track) || IsDtsHd(track);
 
         private static bool IsTrueHd(AudioTrack track)
         {
@@ -2205,6 +2231,55 @@ namespace StremioXbox
             _diagnosticsTimer.Start();
         }
 
+        // Each connection to a debrid server gets only 5-8 Mbps, so 6 connections top out near 50 Mbps: a 4K remux
+        // (70-100 Mbps) drains the buffer. When the download stays under 1.3x the file's average bitrate and the
+        // read-ahead window isn't full, add 2 connections (up to HttpChunkCache.MaxConnections), judged again a
+        // check later; stop adding when the last ones didn't make it faster (a server limit).
+        private void AdaptConnections(HttpChunkCache cache, double mbps, long ahead, double duration)
+        {
+            if (_fileSize <= 0 || duration <= 0 || _starting)
+            {
+                return;
+            }
+
+            if (ahead >= cache.AheadBytes * 0.9)
+            {
+                _slowChecks = 0; // Window full: the download waits for playback, so its rate says nothing.
+                return;
+            }
+
+            var bitrate = _fileSize * 8.0 / duration / 1000000;
+            if (mbps >= bitrate * 1.3 || _connectionsMaxed)
+            {
+                _slowChecks = 0;
+                return;
+            }
+
+            if (++_slowChecks < 1)
+            {
+                return; // The check right after adding: new connections still starting.
+            }
+
+            if (_rateBeforeAdding > 0 && mbps < _rateBeforeAdding * 1.1)
+            {
+                _connectionsMaxed = true;
+                Log("warn", string.Format("More connections didn't speed up the download ({0:0} Mbps before, {1:0} now); staying at {2}", _rateBeforeAdding, mbps, cache.Connections));
+                return;
+            }
+
+            var before = cache.Connections;
+            var added = cache.AddConnections(2);
+            if (added == 0)
+            {
+                _connectionsMaxed = true;
+                return;
+            }
+
+            _rateBeforeAdding = mbps;
+            _slowChecks = -1;
+            Log("info", string.Format("Download {0:0} Mbps for a {1:0} Mbps file: connections {2} -> {3}", mbps, bitrate, before, cache.Connections));
+        }
+
         // Every 5 s: how far playback advanced against the wall clock (a stall shows as media < wall
         // while Playing) and the download rate from DownloadProgress x file size.
         private void LogPace()
@@ -2250,6 +2325,10 @@ namespace StremioXbox
                     var ahead = cache.BufferedAheadBytes;
                     var aheadSeconds = _fileSize > 0 && session.NaturalDuration.TotalSeconds > 0 ? ahead / (_fileSize / session.NaturalDuration.TotalSeconds) : 0;
                     rate = string.Format("{0:0} Mbps, buffer {1} MB ({2:0} s), waited reads {3}", bytesPerSecond * 8 / 1000000, ahead >> 20, aheadSeconds, cache.WaitedReads);
+                    if (_paceTicks > 1) // The first interval counts the whole startup download.
+                    {
+                        AdaptConnections(cache, bytesPerSecond * 8 / 1000000, ahead, session.NaturalDuration.TotalSeconds);
+                    }
                 }
                 else if (_fileSize > 0 && download >= 0 && _lastDownload >= 0 && wall > 0)
                 {
@@ -3102,6 +3181,12 @@ namespace StremioXbox
                 {
                     if (i != index && IsSubtitleTrack(tracks[i]))
                     {
+                        var before = tracks.GetPresentationMode((uint)i);
+                        if (before != TimedMetadataTrackPresentationMode.Disabled && !byUser)
+                        {
+                            Log("info", "Subtitle track was on before the app's choice: " + DescribeSubtitle(tracks[i]) + " (" + before + "); turning it off");
+                        }
+
                         tracks.SetPresentationMode((uint)i, TimedMetadataTrackPresentationMode.Disabled);
                     }
                 }
@@ -3322,6 +3407,7 @@ namespace StremioXbox
             var props = track.GetEncodingProperties();
             var subtype = (props.Subtype ?? string.Empty).ToUpperInvariant();
             return IsTrueHd(track) ? "Dolby TrueHD"
+                : IsDtsHd(track) ? "DTS-HD"
                 : subtype.Contains("EAC3") || subtype.Contains("E-AC3") || subtype.Contains("DDPLUS") ? "Dolby Digital Plus"
                 : subtype.Contains("AC3") ? "Dolby Digital"
                 : subtype.Contains("DTS") ? "DTS"

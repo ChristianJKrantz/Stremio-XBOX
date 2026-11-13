@@ -19,11 +19,35 @@ function New-PortalClient([System.Net.NetworkCredential]$credential) {
     return @{ Client = $client; Cookies = $handler.CookieContainer }
 }
 
-# Connects, asking for the Device Portal login in the terminal only if the console wants one (password hidden).
+# Where Save-XboxLogin.ps1 keeps the login for one console: in this Windows user's local app data (never in the
+# repository), the password encrypted by Windows (DPAPI) so only this Windows account on this PC can read it.
+function Get-XboxLoginPath([string]$Xbox) {
+    $safe = $Xbox -replace '[^A-Za-z0-9.-]', '_'
+    return Join-Path $env:LOCALAPPDATA "StremioXbox\portal-login-$safe.xml"
+}
+
+# Connects with the saved login (Save-XboxLogin.ps1) when there is one, else asks for the Device Portal login in the
+# terminal, only if the console wants one (password hidden).
 function Connect-XboxPortal([string]$Xbox, [int]$Port = 11443) {
     $base = "https://${Xbox}:$Port"
     $http = New-PortalClient $null
     $probe = $http.Client.GetAsync("$base/api/os/info").GetAwaiter().GetResult()
+    $saved = Get-XboxLoginPath $Xbox
+    if ([int]$probe.StatusCode -eq 401 -and (Test-Path $saved)) {
+        try {
+            $credential = Import-Clixml $saved
+            $http = New-PortalClient $credential.GetNetworkCredential()
+            $probe = $http.Client.GetAsync("$base/api/os/info").GetAwaiter().GetResult()
+            if ([int]$probe.StatusCode -eq 401) {
+                Write-Warning "The saved login was refused (changed on the Xbox?). Run scripts\Save-XboxLogin.ps1 -Xbox $Xbox again."
+                $http = New-PortalClient $null
+            } else {
+                Write-Host "Login:        saved login for $Xbox"
+            }
+        } catch {
+            Write-Warning "Could not read the saved login ($($_.Exception.Message)). Run scripts\Save-XboxLogin.ps1 -Xbox $Xbox again."
+        }
+    }
     for ($attempt = 1; [int]$probe.StatusCode -eq 401 -and $attempt -le 3; $attempt++) {
         Write-Host $(if ($attempt -eq 1) { "Device Portal login for $Xbox (set under Remote Access in Dev Home on the Xbox):" } else { 'That login was refused. Try again:' })
         $user = Read-Host '  Username'

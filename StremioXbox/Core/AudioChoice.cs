@@ -13,6 +13,7 @@ namespace StremioXbox.Core
         Dts,
         DolbyDigitalPlus,
         TrueHd,
+        DtsHd,
     }
 
     /// <summary>One audio track of the file, as the chooser sees it.</summary>
@@ -226,6 +227,10 @@ namespace StremioXbox.Core
             if (track.Format == AudioFormat.TrueHd)
             {
                 score -= 100000; // Often silent on Xbox: only when the language has nothing else.
+            }
+            else if (track.Format == AudioFormat.DtsHd)
+            {
+                score -= 200000; // Listed but silent on Xbox (seen with DTS-HD MA): after TrueHD even.
             }
 
             if (track.IsExtra)

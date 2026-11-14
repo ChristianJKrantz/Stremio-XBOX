@@ -57,7 +57,7 @@ Passed through untouched to your soundbar or AVR.
 <td width="50%" valign="top">
 
 **🚀 Custom read buffer**<br>
-8 parallel connections (up to 12) and up to 768 MB of RAM read-ahead that follows the playhead. Built for remuxes that make other players choke.
+6 parallel connections (up to 8) and up to 768 MB of RAM read-ahead that follows the playhead. Built for remuxes that make other players choke.
 
 </td>
 </tr>
@@ -113,10 +113,14 @@ Windows' media player reads a network stream one request at a time, and on large
 jumping to a position far ahead of playback that the download can't keep up with. Every wait
 freezes the picture. Stremio-XBOX puts its own cache in between:
 
-- 8 parallel HTTP range connections (up to 12 when the file needs it) in 1 MB chunks
-- up to 768 MB of read-ahead in RAM, anchored on where playback actually is
+- 6 parallel HTTP range connections (up to 8 when the file needs it): 1 MB pieces next to the playhead,
+  so playback starts fast, and up to 16 MB per request further ahead, so the debrid server sees few requests
+- up to 768 MB of read-ahead in RAM, anchored on where playback actually is, and fed in both places when
+  the Xbox player reads a remux at two spots at once
 - a quick seek right after playback starts that stops the player's far-ahead reads, which was the
   real cause of stutter on 80+ GB files
+- polite to the debrid service: when its server says "too many" (HTTP 429) every connection waits and one
+  closes, and a server that stops answering gets one fresh link a minute, not a flood of retries
 
 
 ## ⚡ Why not just use Edge?
@@ -150,8 +154,13 @@ freezes the picture. Stremio-XBOX puts its own cache in between:
   one inside the file only when no downloaded one in that language arrives. If a video stutters with
   subtitles on, pick a downloaded one with X.
 - **Big remuxes need a fast link.** Debrid servers give each connection only 5-8 Mbps, so the player starts
-  with 8 and adds more (up to 12) while the download is slower than the file's bitrate. A stream's average
-  bitrate is about its size in GB x 143 / runtime in minutes; well above your connection's speed, it buffers.
+  with 6 and adds more (up to 8) while the download is slower than the file's bitrate. TorBox refuses more
+  than about 10 connections per server for one account and can block an address that keeps asking, so
+  that is the ceiling, about 50-60 Mbps. A stream's average bitrate is about its size in GB x 143 / runtime
+  in minutes; well above that, it buffers, and close to it (a 30 GB, 90-minute remux) it takes 30 s or more
+  to start.
+- **A debrid server can stop answering mid-film.** The player asks for a fresh link once a minute; when the
+  service keeps pointing to the same server it says so, and another stream (often on another server) plays.
 - Built for direct / debrid links. Torrent streams need a streaming server.
 
 ## 🎮 Controls

@@ -74,6 +74,39 @@ internal static class Program
         results.Add(string.Format("playing 20 s: {0:0} MB downloaded with {1} requests ({2:0.0} MB per request)",
             playedMb, _requests - before, playedMb / Math.Max(1, _requests - before)));
 
+        // Two cursors, as the Xbox player reads some remuxes: a slow one and the video 150 MB ahead of it.
+        cache.SeekStarted(true);
+        var slowAt = 600L << 20;
+        var fastAt = slowAt + (150L << 20);
+        var fastWaits = 0L;
+        var fastStalls = 0;
+        var two = Stopwatch.StartNew();
+        var slowTask = Task.Run(async () =>
+        {
+            while (two.Elapsed < TimeSpan.FromSeconds(20))
+            {
+                await ReadRange(cache, slowAt, 64 * 1024, "slow cursor");
+                slowAt += 64 * 1024;
+                await Task.Delay(500);
+            }
+        });
+        while (two.Elapsed < TimeSpan.FromSeconds(20))
+        {
+            var took = await ReadRange(cache, fastAt, 1 << 20, "fast cursor");
+            if (took > 50)
+            {
+                fastWaits += took;
+                fastStalls++;
+            }
+
+            fastAt += 1 << 20;
+            await Task.Delay(Math.Max(0, 250 - (int)took)); // 4 MB/s, a 32 Mbps film.
+        }
+
+        await slowTask;
+        results.Add(string.Format("two cursors 20 s: fast cursor waited {0} times, {1} ms in all, reached {2} MB",
+            fastStalls, fastWaits, (fastAt - (750L << 20)) >> 20));
+
         foreach (var line in results)
         {
             Console.WriteLine(line);

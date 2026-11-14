@@ -63,6 +63,9 @@ namespace StremioXbox.Core
         private Uri _url;
         private DateTime _resolvedAt = DateTime.UtcNow;
         private long _playheadChunk;
+        private long _leadChunk; // The player's second cursor, if it reads in two places (see PickNextLocked).
+        private long _lastReadChunk = -1;
+        private long _frontChunk; // The furthest recent read (the playhead trails the reads by up to 3 s).
         private long _downloadedBytes;
         private long _waitedReads;
         private int _readCount;
@@ -129,10 +132,11 @@ namespace StremioXbox.Core
         }
 
         /// <summary>The most read-ahead connections AddConnections goes to (each holds one chunk in flight).</summary>
-        // TorBox's CDN refuses (HTTP 429) more than 20 connections per server and account, and an address
-        // that keeps asking after that gets blocked for about an hour. 10 read-ahead connections, the urgent
-        // one and the probe stay well under it; more never made the download faster (5-8 Mbps each, ~60 total).
-        public const int MaxConnections = 10;
+        // TorBox's CDN answers HTTP 429 past about 10 connections per server for one account (a single extra
+        // request from a PC got 429 while the Xbox held 10), and an address that keeps going over gets blocked
+        // for about an hour. 8 read-ahead connections and the urgent one stay under it; more never made the
+        // download faster anyway (5-8 Mbps each, ~60 Mbps in all).
+        public const int MaxConnections = 8;
         private const int MinConnections = 4;
 
         public long Size { get; }
@@ -612,9 +616,18 @@ namespace StremioXbox.Core
             }
 
             var trailing = index;
+            var leading = index;
             foreach (var read in _recentReads)
             {
                 trailing = Math.Min(trailing, read.Value);
+                leading = Math.Max(leading, read.Value);
+            }
+
+            _frontChunk = leading;
+            if (index != _lastReadChunk)
+            {
+                _lastReadChunk = index;
+                _leadChunk = SecondCursorLocked(trailing, leading);
             }
 
             var jumped = Math.Abs(trailing - _playheadChunk) > 4;
@@ -624,6 +637,12 @@ namespace StremioXbox.Core
             }
 
             _playheadChunk = trailing;
+            if (_holdReadAhead && jumped && trailing > 16)
+            {
+                // The resume point is reached: the hold only kept read-ahead off the start of the file. Held
+                // on, the player's reads around the resume point waited on single downloads (a 10 s seek).
+                _holdReadAhead = false;
+            }
 
             // Only the first read after a requested seek may stop downloads: the window also drifts when the
             // player's reads move on their own, and the chunks it would drop then are ones playback needs.
@@ -763,23 +782,76 @@ namespace StremioXbox.Core
                 return best;
             }
 
+            // The Xbox player can read a file in two places at once: on a 4K remux one cursor crept along
+            // ~1 MB every few seconds while the other (the video) ran 50-300 MB ahead of it. Read-ahead from
+            // the slow one only reached the fast one's area last, so the video kept waiting on single
+            // downloads and stuttered with 40 s "buffered". Each cursor gets the next missing chunk after it,
+            // whichever has less in memory ahead of it first.
             var last = Math.Min(_chunkCount - 1, _playheadChunk + (_holdReadAhead ? 2 : _aheadChunks));
-            for (var i = _playheadChunk; i <= last; i++)
+            var near = FirstMissingLocked(_playheadChunk, last);
+            var lead = _leadChunk;
+            if (!_holdReadAhead && lead > _playheadChunk + 4 && lead <= last)
             {
-                if (!_chunks.TryGetValue(i, out var chunk))
+                var far = FirstMissingLocked(lead, last);
+                if (far >= 0 && (near < 0 || near >= lead || far - lead < near - _playheadChunk))
                 {
-                    chunk = new Chunk(i);
-                    _chunks[i] = chunk;
-                    return chunk;
-                }
-
-                if (chunk.Data == null && !chunk.Downloading)
-                {
-                    return chunk;
+                    near = far;
                 }
             }
 
-            return null;
+            if (near < 0)
+            {
+                return null;
+            }
+
+            if (!_chunks.TryGetValue(near, out var picked))
+            {
+                picked = new Chunk(near);
+                _chunks[near] = picked;
+            }
+
+            return picked;
+        }
+
+        // The furthest recent read when the recent reads form two groups with a gap of more than 8 MB between
+        // them (two cursors); otherwise the trailing read (one cursor, however fast it moves).
+        private long SecondCursorLocked(long trailing, long leading)
+        {
+            if (leading - trailing <= 8)
+            {
+                return trailing;
+            }
+
+            var seen = new List<long>();
+            foreach (var read in _recentReads)
+            {
+                seen.Add(read.Value);
+            }
+
+            seen.Sort();
+            for (var i = 1; i < seen.Count; i++)
+            {
+                if (seen[i] - seen[i - 1] > 8)
+                {
+                    return leading;
+                }
+            }
+
+            return trailing;
+        }
+
+        // The first chunk from..last that is neither in memory nor downloading, or -1.
+        private long FirstMissingLocked(long from, long last)
+        {
+            for (var i = from; i <= last; i++)
+            {
+                if (!_chunks.TryGetValue(i, out var chunk) || (chunk.Data == null && !chunk.Downloading))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
         }
 
         private void Wake()
@@ -794,8 +866,8 @@ namespace StremioXbox.Core
         // an hour after a few hundred requests in a minute or so: with one 1 MB request per chunk that came
         // about 50 s into a 4K film (three servers in one afternoon). Near the playhead each chunk still gets
         // its own request, so they arrive in parallel and playback starts quickly; further ahead one request
-        // fetches up to 8 MB in a row, which cuts the request rate about eight times while playing.
-        private const int MaxRunChunks = 8;
+        // fetches up to 16 MB in a row (8 MB still got a server to stop after 18 minutes of a 49 Mbps film).
+        private const int MaxRunChunks = 16;
 
         private async Task WorkerAsync(bool urgentOnly)
         {
@@ -828,7 +900,11 @@ namespace StremioXbox.Core
                     {
                         chunk.Downloading = true;
                         run = new List<Chunk> { chunk };
-                        var ahead = chunk.Index - _playheadChunk;
+                        // Distance from the read the chunk is for, not from the playhead (which trails the reads
+                        // by up to 3 s): runs right in front of a fast reader came from one 5-8 Mbps connection,
+                        // and a 49 Mbps remux's resume seek took 10 s waiting on them. Next to a read: single requests.
+                        var anchor = chunk.Index >= _frontChunk ? _frontChunk : chunk.Index >= _leadChunk ? _leadChunk : _playheadChunk;
+                        var ahead = chunk.Index - anchor;
                         var most = urgentOnly || chunk.Waiters > 0 || ahead < 12 ? 1 : (int)Math.Min(MaxRunChunks, ahead / 8 + 1);
                         var last = Math.Min(_chunkCount - 1, _playheadChunk + _aheadChunks);
                         for (var i = chunk.Index + 1; run.Count < most && i <= last; i++)

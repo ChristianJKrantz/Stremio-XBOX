@@ -61,7 +61,7 @@ namespace StremioXbox
         private bool _cursorMode = ReadSetting("cursorMode", false);
         private bool _attachSubtitles = true; // LB in the debug log toggles it (stutter tests in 0.1.3.1).
         private HttpChunkCache _cache;
-        private int _connections = 8; // 0 = hand the URL to the player directly; RB in the debug log cycles it.
+        private int _connections = 6; // 0 = hand the URL to the player directly; RB in the debug log cycles it.
 
         // Restart seek modes (Menu in the debug log cycles them): seconds to jump forward before returning;
         // positive = after playback starts, negative = before playing (0.1.3.7), 0 = off.
@@ -331,6 +331,9 @@ namespace StremioXbox
                 "\"debugLog\":" + (DebugPanel.Visibility == Visibility.Visible ? "true" : "false"),
                 "\"toast\":" + (Toast.Visibility == Visibility.Visible ? RemoteControl.Json(ToastText.Text) : "null"),
                 "\"osdMessage\":" + RemoteControl.Json(_osdMessage),
+                "\"upNext\":" + (UpNext.Visibility == Visibility.Visible ? "true" : "false"),
+                "\"skipIntro\":" + (SkipIntro.Visibility == Visibility.Visible ? "true" : "false"),
+                "\"osd\":" + (Osd.Visibility == Visibility.Visible ? "true" : "false"),
             };
 
             var session = _mediaPlayer?.PlaybackSession;
@@ -1154,10 +1157,10 @@ namespace StremioXbox
             _binge = request.Binge;
             _nextLabel = string.IsNullOrEmpty(request.Next) ? null : request.Next;
             LoadingTitle.Text = request.DisplayTitle;
-            var resumes = request.StartPositionMs > 0 && !_startOverRequested;
+            var resumes = request.StartPositionMs >= 5000 && !_startOverRequested;
             LoadingText.Text = resumes
                 ? "Resuming from " + FormatTime(TimeSpan.FromMilliseconds(request.StartPositionMs))
-                : request.StartPositionMs > 0 ? "Starting from the beginning" : request.DisplaySubtitle;
+                : _startOverRequested && request.StartPositionMs > 0 ? "Starting from the beginning" : request.DisplaySubtitle;
             LoadingKeys.Text = resumes ? "X  Start from the beginning        B  Back" : "B  Back";
             SetBackdrop(request.Background);
             if (request.HasRequestHeaders)
@@ -1694,7 +1697,7 @@ namespace StremioXbox
                     return;
                 }
 
-                if (request.StartPositionMs > 0 && !_startOverRequested)
+                if (request.StartPositionMs >= 5000 && !_startOverRequested)
                 {
                     LoadingText.Text = "Resuming from " + FormatTime(TimeSpan.FromMilliseconds(request.StartPositionMs));
                 }
@@ -2345,6 +2348,7 @@ namespace StremioXbox
                     origin = TimeSpan.Zero;
                 }
 
+                // Also after a resume: without it (0.2.31) a 49 Mbps remux played 40 s of video in 100 s.
                 var restartSeek = reopened ? 0 : RestartSeekModes[_restartSeekMode];
                 if (restartSeek < 0)
                 {
@@ -3560,7 +3564,50 @@ namespace StremioXbox
                 var indices = Enumerable.Range(0, tracks.Count).Where(i => IsSubtitleTrack(tracks[i])).ToList();
                 var shown = indices.Where(i => tracks.GetPresentationMode((uint)i) != TimedMetadataTrackPresentationMode.Disabled).ToList();
                 entries.Add(new MenuEntry("Off", shown.Count == 0, () => SelectSubtitle(item, -1, true)));
-                entries.AddRange(indices.Select(index => new MenuEntry(DescribeSubtitle(tracks[index]), shown.Contains(index), () => SelectSubtitle(item, index, true))));
+
+                // As TV apps list them: language names ("English", not "eng (OpenSubtitles v3)"), the viewer's
+                // subtitle language first, then the others alphabetically; within a language the downloaded
+                // ones before the ones inside the file (those can stutter 4K playback), numbered when alike.
+                var preferred = _originalAudio ? "en" : _current?.SubtitlesLanguage;
+                var rows = indices.Select((index, order) =>
+                {
+                    var track = tracks[index];
+                    var downloaded = !string.IsNullOrEmpty(track.Label) && _externalSubtitleLanguages.TryGetValue(track.Label, out _);
+                    var code = downloaded ? _externalSubtitleLanguages[track.Label] : track.Language;
+                    var language = string.IsNullOrWhiteSpace(code) || NormalizeLanguage(code) == "und" ? null : LanguageName(code);
+                    string name;
+                    if (downloaded)
+                    {
+                        var open = track.Label.LastIndexOf('(');
+                        var source = open >= 0 && track.Label.EndsWith(")") ? track.Label.Substring(open + 1, track.Label.Length - open - 2) : "Downloaded";
+                        source = Regex.Replace(source, @"\s+v\d+$", string.Empty); // "OpenSubtitles v3" -> "OpenSubtitles"
+                        name = (language ?? track.Label) + "  ·  " + source;
+                    }
+                    else
+                    {
+                        var label = string.IsNullOrEmpty(track.Label) ? language ?? "Unknown" : track.Label;
+                        name = label + "  ·  In the file" + (track.TimedMetadataKind == TimedMetadataKind.ImageSubtitle ? " (image)" : string.Empty);
+                    }
+
+                    return new
+                    {
+                        Index = index,
+                        Order = order,
+                        Name = name,
+                        Group = language ?? name,
+                        First = !string.IsNullOrEmpty(preferred) && !string.IsNullOrWhiteSpace(code) && LanguageMatches(code, preferred),
+                        Downloaded = downloaded,
+                    };
+                }).OrderByDescending(row => row.First).ThenBy(row => row.Group, StringComparer.CurrentCultureIgnoreCase)
+                  .ThenByDescending(row => row.Downloaded).ThenBy(row => row.Order).ToList();
+                var seen = new Dictionary<string, int>();
+                foreach (var row in rows)
+                {
+                    seen[row.Name] = seen.TryGetValue(row.Name, out var count) ? count + 1 : 1;
+                    var name = rows.Count(other => other.Name == row.Name) > 1 ? row.Name + " " + seen[row.Name] : row.Name;
+                    var index = row.Index;
+                    entries.Add(new MenuEntry(name, shown.Contains(index), () => SelectSubtitle(item, index, true)));
+                }
             }
             catch (Exception ex)
             {
